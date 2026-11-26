@@ -105,7 +105,14 @@ pub(crate) fn batch_inversion_with_scratch(
     }
 
     // Invert `tmp`.
-    tmp = tmp.invert().unwrap(); // Guaranteed to be nonzero.
+    #[cfg(feature = "blst-backend")]
+    {
+        tmp = crate::blst_backend::fr_invert_nonzero(&tmp);
+    }
+    #[cfg(not(feature = "blst-backend"))]
+    {
+        tmp = tmp.invert().unwrap(); // Guaranteed to be nonzero.
+    }
 
     // Second pass: iterate backwards to compute inverses
     for (f, s) in v

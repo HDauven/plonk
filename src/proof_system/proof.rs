@@ -137,36 +137,17 @@ impl Serializable<{ 11 * Commitment::SIZE + ProofEvaluations::SIZE }>
                 comm_bytes.as_chunks::<{ Commitment::SIZE }>();
             let mut comms = [Ok(Commitment::default()); 11];
             if rayon::current_num_threads() > 1 {
-                // 4-way flat join (3+3+3+2 points) avoids waking 11 threads on
-                // hybrid cores while keeping critical-path decode at 3 points.
-                let (c05, c610) = comm_chunks.split_at(6);
-                let (c02, c35) = c05.split_at(3);
-                let (c68, c910) = c610.split_at(3);
-                let (s05, s610) = comms.split_at_mut(6);
-                let (s02, s35) = s05.split_at_mut(3);
-                let (s68, s910) = s610.split_at_mut(3);
-                let decode_slice =
-                    |slots: &mut [Result<Commitment, dusk_bytes::Error>],
-                     chunks: &[[u8; Commitment::SIZE]]| {
+                // 4-way split (3+3+3+2 points) stays well inside P-cores
+                // without excessive thread-wakeup tail latency.
+                comms
+                    .par_chunks_mut(3)
+                    .zip(comm_chunks.par_chunks(3))
+                    .for_each(|(slots, chunks)| {
                         for (slot, chunk) in slots.iter_mut().zip(chunks.iter())
                         {
                             *slot = Commitment::from_bytes(chunk);
                         }
-                    };
-                rayon::join(
-                    || {
-                        rayon::join(
-                            || decode_slice(s02, c02),
-                            || decode_slice(s35, c35),
-                        )
-                    },
-                    || {
-                        rayon::join(
-                            || decode_slice(s68, c68),
-                            || decode_slice(s910, c910),
-                        )
-                    },
-                );
+                    });
             } else {
                 for (slot, chunk) in comms.iter_mut().zip(comm_chunks.iter()) {
                     *slot = Commitment::from_bytes(chunk);
@@ -401,7 +382,7 @@ pub(crate) mod alloc {
         }
 
         /// Execute the final 2-pair BLS12-381 pairing check on affine inputs.
-        #[cfg(feature = "blst-backend")]
+        #[cfg(all(feature = "blst-backend", test))]
         pub(crate) fn verify_pairing_affine(
             opening_key: &OpeningKey,
             left_affine: G1Affine,
@@ -799,21 +780,20 @@ pub(crate) mod alloc {
             #[cfg(all(feature = "blst-backend", not(test)))]
             {
                 let _ = (verifier_key, static_points);
-                let (left_affine, right_affine) =
-                    crate::proof_system::verifier_msm::verifier_msm_single_affine(
-                        static_tables,
-                        &prepared.static_scalars,
-                        &prepared.dynamic_points,
-                        &prepared.dynamic_scalars,
-                        &prepared.w_z,
-                        &prepared.w_zw,
-                        &prepared.u_challenge,
-                    );
-                Self::verify_pairing_affine(
-                    opening_key,
-                    left_affine,
-                    right_affine,
-                )
+                if !crate::blst_backend::verify_single_pipelined_blst(
+                    &static_tables.blst,
+                    &prepared.static_scalars,
+                    &prepared.dynamic_points,
+                    &prepared.dynamic_scalars,
+                    &prepared.w_z,
+                    &prepared.w_zw,
+                    &prepared.u_challenge,
+                    &opening_key.blst_lines_x_h,
+                    &opening_key.blst_lines_h,
+                ) {
+                    return Err(Error::ProofVerificationError);
+                }
+                Ok(())
             }
 
             #[cfg(not(all(feature = "blst-backend", not(test))))]

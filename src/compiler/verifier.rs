@@ -421,14 +421,18 @@ impl Verifier {
                 }
             }
 
-            let (left, right) = crate::blst_backend::verify_batch_msm_blst(
+            if !crate::blst_backend::verify_batch_pipelined_blst(
                 &left_pts,
                 &left_scs,
                 &right_dyn_pts,
                 &right_dyn_scs,
                 Some((&self.static_tables.blst, &merged_static)),
-            );
-            Proof::verify_pairing_affine(&self.opening_key, left, right)
+                &self.opening_key.blst_lines_x_h,
+                &self.opening_key.blst_lines_h,
+            ) {
+                return Err(Error::ProofVerificationError);
+            }
+            Ok(())
         }
         #[cfg(not(feature = "blst-backend"))]
         {
@@ -829,10 +833,18 @@ impl<'a> BatchVerifier<'a> {
 
         #[cfg(feature = "blst-backend")]
         {
-            let (left, right) = crate::blst_backend::verify_batch_msm_blst(
-                &left_pts, &left_scs, &right_pts, &right_scs, None,
-            );
-            Proof::verify_pairing_affine(opening_key, left, right)
+            if !crate::blst_backend::verify_batch_pipelined_blst(
+                &left_pts,
+                &left_scs,
+                &right_pts,
+                &right_scs,
+                None,
+                &opening_key.blst_lines_x_h,
+                &opening_key.blst_lines_h,
+            ) {
+                return Err(Error::ProofVerificationError);
+            }
+            Ok(())
         }
         #[cfg(not(feature = "blst-backend"))]
         {
