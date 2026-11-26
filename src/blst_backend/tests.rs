@@ -505,3 +505,36 @@ fn blst_pipelined_verify_matches_split() {
         &lines_h,
     ));
 }
+
+#[test]
+fn blst_batched_affine_explicit_cancellation_and_doubling() {
+    let mut rng = StdRng::seed_from_u64(0xca0c_e101);
+    for n in [1024usize, 4096] {
+        let mut pts: Vec<G1Affine> = (0..n)
+            .map(|_| {
+                G1Affine::from(
+                    G1Projective::generator() * BlsScalar::random(&mut rng),
+                )
+            })
+            .collect();
+        let mut scs: Vec<BlsScalar> =
+            (0..n).map(|_| BlsScalar::random(&mut rng)).collect();
+        // Pair `pts[2*k]` and `-pts[2*k]` with identical scalars so they land
+        // in the exact same bucket and exercise true `P + (-P)` cancellation,
+        // and pair identical bases with identical scalars for true `P + P`.
+        for k in 0..32 {
+            pts[2 * k + 1] = -pts[2 * k];
+            scs[2 * k + 1] = scs[2 * k];
+        }
+        for k in 32..64 {
+            pts[2 * k + 1] = pts[2 * k];
+            scs[2 * k + 1] = scs[2 * k];
+        }
+        let blst_pts = g1_affines_to_blst(&pts);
+        let expected = G1Affine::from(msm_variable_base(&pts, &scs));
+        for w in [None, Some(10), Some(12), Some(13)] {
+            let [got] = msm_g1_batch_affine(&blst_pts, [&scs[..]], w);
+            assert_eq!(got, expected, "cancellation mismatch n={n} w={w:?}");
+        }
+    }
+}

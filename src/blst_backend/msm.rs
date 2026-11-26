@@ -209,6 +209,10 @@ pub(super) fn blst_tile_pippenger_raw(
     tile_unit_u64: usize,
 ) -> blst_p1 {
     let dx = points.len();
+    debug_assert!(
+        dx >= 2,
+        "blst_p1s_tile_pippenger requires at least 2 points"
+    );
     debug_assert_eq!(scalar_bytes.len(), dx * nbits.div_ceil(8));
     PIPPENGER_SCRATCH.with(|cell| {
         let mut scratch = cell.borrow_mut();

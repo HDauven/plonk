@@ -211,6 +211,10 @@ pub(super) fn batched_affine_tile_pippenger(
     window: usize,
 ) -> blst_p1 {
     let n = points.len();
+    assert!(
+        n <= (u32::MAX >> 1) as usize,
+        "batched-affine tile exceeds 31-bit point index capacity"
+    );
     debug_assert_eq!(scalar_bytes.len(), n * SCALAR_BYTES);
     debug_assert!((2..=15).contains(&window));
     if n == 0 {

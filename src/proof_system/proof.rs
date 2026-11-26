@@ -381,27 +381,10 @@ pub(crate) mod alloc {
             Ok(prepared)
         }
 
-        /// Execute the final 2-pair BLS12-381 pairing check on affine inputs.
-        #[cfg(all(feature = "blst-backend", test))]
-        pub(crate) fn verify_pairing_affine(
-            opening_key: &OpeningKey,
-            left_affine: G1Affine,
-            right_affine: G1Affine,
-        ) -> Result<(), Error> {
-            if !crate::blst_backend::verify_pairing_lines(
-                &left_affine,
-                &right_affine,
-                &opening_key.blst_lines_x_h,
-                &opening_key.blst_lines_h,
-            ) {
-                return Err(Error::ProofVerificationError);
-            }
-            Ok(())
-        }
-
         /// Execute the final 2-pair BLS12-381 pairing check shared by single
-        /// and batched verification.
-        #[cfg(not(all(feature = "blst-backend", not(test))))]
+        /// and batched verification (pure-Rust fallback when `blst-backend` is
+        /// disabled).
+        #[cfg(not(feature = "blst-backend"))]
         pub(crate) fn verify_pairing(
             opening_key: &OpeningKey,
             left_projective: G1Projective,
@@ -411,24 +394,17 @@ pub(crate) mod alloc {
             let mut affines = [G1Affine::identity(); 2];
             G1Projective::batch_normalize(&projectives, &mut affines);
 
-            #[cfg(feature = "blst-backend")]
-            {
-                Self::verify_pairing_affine(opening_key, affines[0], affines[1])
-            }
-            #[cfg(not(feature = "blst-backend"))]
-            {
-                let pairing = dusk_bls12_381::multi_miller_loop(&[
-                    (&affines[0], &opening_key.prepared_x_h),
-                    (&affines[1], &opening_key.prepared_h),
-                ])
-                .final_exponentiation();
+            let pairing = dusk_bls12_381::multi_miller_loop(&[
+                (&affines[0], &opening_key.prepared_x_h),
+                (&affines[1], &opening_key.prepared_h),
+            ])
+            .final_exponentiation();
 
-                if pairing != dusk_bls12_381::Gt::identity() {
-                    return Err(Error::ProofVerificationError);
-                }
-
-                Ok(())
+            if pairing != dusk_bls12_381::Gt::identity() {
+                return Err(Error::ProofVerificationError);
             }
+
+            Ok(())
         }
 
         #[allow(non_snake_case)]
@@ -777,9 +753,72 @@ pub(crate) mod alloc {
                 bind_selectors,
             )?;
 
-            #[cfg(all(feature = "blst-backend", not(test)))]
+            #[cfg(feature = "blst-backend")]
             {
+                #[cfg(not(test))]
                 let _ = (verifier_key, static_points);
+
+                #[cfg(test)]
+                {
+                    let (_left_projective, right_projective) =
+                        verifier_msm_single(
+                            static_points,
+                            static_tables,
+                            &prepared.static_scalars,
+                            &prepared.dynamic_points,
+                            &prepared.dynamic_scalars,
+                            &prepared.w_z,
+                            &prepared.w_zw,
+                            &prepared.u_challenge,
+                        );
+                    let ref_data = _ref_data;
+                    let f_points_full = [
+                        self.a_comm.0,
+                        self.b_comm.0,
+                        self.c_comm.0,
+                        self.d_comm.0,
+                        verifier_key.permutation.s_sigma_1.0,
+                        verifier_key.permutation.s_sigma_2.0,
+                        verifier_key.permutation.s_sigma_3.0,
+                        verifier_key.arithmetic.q_arith.0,
+                        verifier_key.arithmetic.q_c.0,
+                        verifier_key.arithmetic.q_l.0,
+                        verifier_key.arithmetic.q_r.0,
+                    ];
+                    let f_points = if bind_selectors {
+                        &f_points_full[..]
+                    } else {
+                        &f_points_full[..V_MAX_DEGREE_LEGACY]
+                    };
+                    assert_grouped_msm_equivalence(
+                        &right_projective,
+                        self.compute_reference_linearization_commitment(
+                            &ref_data.alpha,
+                            &ref_data.beta,
+                            &ref_data.gamma,
+                            (
+                                &ref_data.range_sep_challenge,
+                                &ref_data.logic_sep_challenge,
+                                &ref_data.fixed_base_sep_challenge,
+                                &ref_data.var_base_sep_challenge,
+                            ),
+                            &ref_data.z_challenge,
+                            &ref_data.u_challenge,
+                            ref_data.l1_eval,
+                            verifier_key,
+                            domain,
+                        ),
+                        f_points,
+                        &ref_data.f_scalars,
+                        opening_key.g,
+                        ref_data.e_scalar,
+                        self.w_z_chall_comm.0,
+                        ref_data.z_challenge,
+                        self.w_z_chall_w_comm.0,
+                        ref_data.shifted_witness_scalar,
+                    );
+                }
+
                 if !crate::blst_backend::verify_single_pipelined_blst(
                     &static_tables.blst,
                     &prepared.static_scalars,
@@ -796,7 +835,7 @@ pub(crate) mod alloc {
                 Ok(())
             }
 
-            #[cfg(not(all(feature = "blst-backend", not(test))))]
+            #[cfg(not(feature = "blst-backend"))]
             {
                 let (left_projective, right_projective) = verifier_msm_single(
                     static_points,

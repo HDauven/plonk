@@ -95,9 +95,7 @@ pub(crate) fn batch_inversion_with_scratch(
 
     // First pass: compute [a, ab, abc, ...]
     prod.clear();
-    if prod.capacity() < v.len() {
-        prod.reserve(v.len() - prod.capacity());
-    }
+    prod.reserve(v.len());
     let mut tmp = BlsScalar::one();
     for f in v.iter().filter(|f| f != &&BlsScalar::zero()) {
         tmp.mul_assign(f);

@@ -842,6 +842,10 @@ unsafe fn coset_fold_bitrev_adx(
     coset_powers: &[FastFr],
 ) {
     let len = poly.len();
+    debug_assert!(
+        len <= 2 * n,
+        "coset_fold_bitrev_adx requires poly.len() <= 2 * n"
+    );
     let low_len = len.min(n);
     let extra = len.saturating_sub(n);
 
@@ -870,6 +874,10 @@ fn coset_fold_bitrev_portable(
     coset_powers: &[FastFr],
 ) {
     let len = poly.len();
+    debug_assert!(
+        len <= 2 * n,
+        "coset_fold_bitrev_adx requires poly.len() <= 2 * n"
+    );
     let low_len = len.min(n);
     let extra = len.saturating_sub(n);
     for j in 0..extra.min(n) {
@@ -1075,7 +1083,7 @@ unsafe fn poly_lincomb_chunk_adx(
     out_chunk: &mut [BlsScalar],
 ) {
     let len = out_chunk.len();
-    let mut acc = vec![FastFr::ZERO; len];
+    let mut acc: Vec<FastFr> = out_chunk.iter().map(FastFr::from_bls).collect();
     for (scalar, poly) in terms {
         let fs = FastFr::from_bls(scalar);
         if fs.is_zero() || start >= poly.len() {

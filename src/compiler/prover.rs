@@ -37,7 +37,8 @@ pub struct Prover {
     #[cfg(feature = "blst-backend")]
     blst_powers: alloc::sync::Arc<Vec<blst::blst_p1_affine>>,
     #[cfg(feature = "blst-backend")]
-    blst_lagrange_powers: alloc::sync::Arc<Vec<blst::blst_p1_affine>>,
+    blst_lagrange_powers:
+        alloc::sync::Arc<std::sync::OnceLock<Vec<blst::blst_p1_affine>>>,
     pub(crate) verifier_key: VerifierKey,
     pub(crate) transcript: Transcript,
     sigma_evaluations: [Vec<BlsScalar>; 4],
@@ -137,11 +138,7 @@ impl Prover {
         );
         #[cfg(feature = "blst-backend")]
         let blst_lagrange_powers =
-            alloc::sync::Arc::new(if blst_powers.len() >= size {
-                crate::blst_backend::g1_ifft_blst(&blst_powers[..size], &domain)
-            } else {
-                Vec::new()
-            });
+            alloc::sync::Arc::new(std::sync::OnceLock::new());
 
         Ok(Self {
             label,
@@ -759,13 +756,19 @@ impl Prover {
         // ([a(x)]_1, [b(x)]_1, [c(x)]_1, [d(x)]_1)
         #[cfg(feature = "blst-backend")]
         let [a_comm, b_comm, c_comm, d_comm] = {
-            if self.blst_lagrange_powers.len() == size
-                && size + 3 <= self.blst_powers.len()
+            if size + 3 <= self.blst_powers.len()
                 && a_poly.degree() <= self.commit_key.max_degree()
                 && b_poly.degree() <= self.commit_key.max_degree()
                 && c_poly.degree() <= self.commit_key.max_degree()
                 && d_poly.degree() <= self.commit_key.max_degree()
             {
+                let lagrange_powers =
+                    self.blst_lagrange_powers.get_or_init(|| {
+                        crate::blst_backend::g1_ifft_blst(
+                            &self.blst_powers[..size],
+                            &domain,
+                        )
+                    });
                 let blinder_slices = [
                     &wire_blinders[..3],
                     &wire_blinders[3..6],
@@ -773,7 +776,7 @@ impl Prover {
                     &wire_blinders[8..],
                 ];
                 let affines = crate::blst_backend::msm_g1_lagrange_batch(
-                    &self.blst_lagrange_powers,
+                    lagrange_powers,
                     &self.blst_powers,
                     [
                         a_scalars.as_slice(),
