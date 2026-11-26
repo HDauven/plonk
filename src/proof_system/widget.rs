@@ -281,6 +281,32 @@ pub(crate) mod alloc {
         pub(crate) fn seed_transcript(&self, transcript: &mut Transcript) {
             self.seed_transcript_inner(transcript, true);
         }
+
+        /// Returns the 16 static verifier commitments in canonical slot order:
+        /// 15 circuit verifier-key commitments followed by `g`.
+        pub(crate) fn static_points(
+            &self,
+            g: dusk_bls12_381::G1Affine,
+        ) -> [dusk_bls12_381::G1Affine; 16] {
+            [
+                self.arithmetic.q_m.0,
+                self.arithmetic.q_l.0,
+                self.arithmetic.q_r.0,
+                self.arithmetic.q_o.0,
+                self.arithmetic.q_f.0,
+                self.arithmetic.q_c.0,
+                self.arithmetic.q_arith.0,
+                self.range.q_range.0,
+                self.logic.q_logic.0,
+                self.fixed_base.q_fixed_group_add.0,
+                self.variable_base.q_variable_group_add.0,
+                self.permutation.s_sigma_1.0,
+                self.permutation.s_sigma_2.0,
+                self.permutation.s_sigma_3.0,
+                self.permutation.s_sigma_4.0,
+                g,
+            ]
+        }
     }
 
     /// PLONK circuit Proving Key.

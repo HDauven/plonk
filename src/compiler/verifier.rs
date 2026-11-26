@@ -6,7 +6,7 @@
 
 use alloc::vec::Vec;
 
-use dusk_bls12_381::BlsScalar;
+use dusk_bls12_381::{BlsScalar, G1Affine};
 use dusk_bytes::{DeserializableSlice, Serializable};
 use merlin::Transcript;
 
@@ -14,6 +14,9 @@ use super::PlonkVersion;
 use crate::commitment_scheme::OpeningKey;
 use crate::error::Error;
 use crate::fft::EvaluationDomain;
+use crate::proof_system::verifier_msm::{
+    STATIC_POINT_COUNT, StaticVerifierTables,
+};
 use crate::proof_system::{Proof, VerifierKey};
 use crate::transcript::TranscriptProtocol;
 /// Verify proofs of a given circuit
@@ -25,6 +28,9 @@ pub struct Verifier {
     public_input_roots: Vec<BlsScalar>,
     domain: EvaluationDomain,
     transcript: Transcript,
+    transcript_v3: Transcript,
+    static_points: [G1Affine; STATIC_POINT_COUNT],
+    static_tables: StaticVerifierTables,
     size: usize,
     constraints: usize,
 }
@@ -57,6 +63,10 @@ impl Verifier {
             .collect();
         let transcript =
             Transcript::base(label.as_slice(), &verifier_key, constraints);
+        let transcript_v3 =
+            Transcript::base_v3(label.as_slice(), &verifier_key, constraints);
+        let static_points = verifier_key.static_points(opening_key.g);
+        let static_tables = StaticVerifierTables::new(&static_points);
 
         Ok(Self {
             label,
@@ -66,6 +76,9 @@ impl Verifier {
             public_input_roots,
             domain,
             transcript,
+            transcript_v3,
+            static_points,
+            static_tables,
             size,
             constraints,
         })
@@ -283,6 +296,8 @@ impl Verifier {
                 &self.domain,
                 &self.public_input_roots,
                 public_inputs,
+                &self.static_points,
+                &self.static_tables,
             ),
             PlonkVersion::V2 | PlonkVersion::V3 => proof.verify(
                 &self.verifier_key,
@@ -291,6 +306,8 @@ impl Verifier {
                 &self.domain,
                 &self.public_input_roots,
                 public_inputs,
+                &self.static_points,
+                &self.static_tables,
             ),
         }
     }
@@ -298,11 +315,7 @@ impl Verifier {
     fn transcript_for_version(&self, version: PlonkVersion) -> Transcript {
         match version {
             PlonkVersion::V1 | PlonkVersion::V2 => self.transcript.clone(),
-            PlonkVersion::V3 => Transcript::base_v3(
-                self.label.as_slice(),
-                &self.verifier_key,
-                self.constraints,
-            ),
+            PlonkVersion::V3 => self.transcript_v3.clone(),
         }
     }
 }

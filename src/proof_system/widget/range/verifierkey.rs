@@ -31,11 +31,36 @@ mod alloc {
     use super::*;
     use crate::proof_system::linearization_poly::ProofEvaluations;
     use crate::proof_system::widget::range::proverkey::delta;
+    #[cfg(test)]
     #[rustfmt::skip]
     use ::alloc::vec::Vec;
-    use dusk_bls12_381::{BlsScalar, G1Affine};
+    use dusk_bls12_381::BlsScalar;
+    #[cfg(test)]
+    use dusk_bls12_381::G1Affine;
 
     impl VerifierKey {
+        pub(crate) fn linearization_scalar(
+            range_separation_challenge: &BlsScalar,
+            evaluations: &ProofEvaluations,
+        ) -> BlsScalar {
+            let four = BlsScalar::from(4);
+
+            let kappa = range_separation_challenge.square();
+            let kappa_sq = kappa.square();
+            let kappa_cu = kappa_sq * kappa;
+
+            let b_1 = delta(evaluations.c_eval - (four * evaluations.d_eval));
+            let b_2 =
+                delta(evaluations.b_eval - four * evaluations.c_eval) * kappa;
+            let b_3 = delta(evaluations.a_eval - four * evaluations.b_eval)
+                * kappa_sq;
+            let b_4 = delta(evaluations.d_w_eval - (four * evaluations.a_eval))
+                * kappa_cu;
+
+            (b_1 + b_2 + b_3 + b_4) * range_separation_challenge
+        }
+
+        #[cfg(test)]
         pub(crate) fn compute_linearization_commitment(
             &self,
             range_separation_challenge: &BlsScalar,
