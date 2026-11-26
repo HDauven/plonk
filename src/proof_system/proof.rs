@@ -291,6 +291,118 @@ pub(crate) mod alloc {
     type RefCheck = ();
 
     impl Proof {
+        /// Absorbs every proof commitment and evaluation into a batch
+        /// verification transcript.
+        pub(crate) fn append_to_batch_transcript(
+            &self,
+            transcript: &mut Transcript,
+        ) {
+            let Self {
+                a_comm,
+                b_comm,
+                c_comm,
+                d_comm,
+                z_comm,
+                t_low_comm,
+                t_mid_comm,
+                t_high_comm,
+                t_fourth_comm,
+                w_z_chall_comm,
+                w_z_chall_w_comm,
+                evaluations,
+            } = self;
+
+            transcript.append_commitment(b"a_comm", a_comm);
+            transcript.append_commitment(b"b_comm", b_comm);
+            transcript.append_commitment(b"c_comm", c_comm);
+            transcript.append_commitment(b"d_comm", d_comm);
+            transcript.append_commitment(b"z_comm", z_comm);
+            transcript.append_commitment(b"t_low_comm", t_low_comm);
+            transcript.append_commitment(b"t_mid_comm", t_mid_comm);
+            transcript.append_commitment(b"t_high_comm", t_high_comm);
+            transcript.append_commitment(b"t_fourth_comm", t_fourth_comm);
+            transcript.append_commitment(b"w_z_chall_comm", w_z_chall_comm);
+            transcript.append_commitment(b"w_z_chall_w_comm", w_z_chall_w_comm);
+
+            let ProofEvaluations {
+                a_eval,
+                b_eval,
+                c_eval,
+                d_eval,
+                a_w_eval,
+                b_w_eval,
+                d_w_eval,
+                q_arith_eval,
+                q_c_eval,
+                q_l_eval,
+                q_r_eval,
+                s_sigma_1_eval,
+                s_sigma_2_eval,
+                s_sigma_3_eval,
+                z_eval,
+            } = evaluations;
+
+            transcript.append_scalar(b"a_eval", a_eval);
+            transcript.append_scalar(b"b_eval", b_eval);
+            transcript.append_scalar(b"c_eval", c_eval);
+            transcript.append_scalar(b"d_eval", d_eval);
+            transcript.append_scalar(b"a_w_eval", a_w_eval);
+            transcript.append_scalar(b"b_w_eval", b_w_eval);
+            transcript.append_scalar(b"d_w_eval", d_w_eval);
+            transcript.append_scalar(b"q_arith_eval", q_arith_eval);
+            transcript.append_scalar(b"q_c_eval", q_c_eval);
+            transcript.append_scalar(b"q_l_eval", q_l_eval);
+            transcript.append_scalar(b"q_r_eval", q_r_eval);
+            transcript.append_scalar(b"s_sigma_1_eval", s_sigma_1_eval);
+            transcript.append_scalar(b"s_sigma_2_eval", s_sigma_2_eval);
+            transcript.append_scalar(b"s_sigma_3_eval", s_sigma_3_eval);
+            transcript.append_scalar(b"z_eval", z_eval);
+        }
+
+        /// Replay the proof's Fiat-Shamir transcript and return its scalar
+        /// weights and dynamic commitments for batched verification.
+        pub(crate) fn prepare_verification(
+            &self,
+            transcript: &mut Transcript,
+            domain: &EvaluationDomain,
+            public_input_roots: &[BlsScalar],
+            pub_inputs: &[BlsScalar],
+            bind_selectors: bool,
+        ) -> Result<PreparedVerification, Error> {
+            let (prepared, _) = self.prepare_with_ref(
+                transcript,
+                domain,
+                public_input_roots,
+                pub_inputs,
+                bind_selectors,
+            )?;
+            Ok(prepared)
+        }
+
+        /// Execute the final 2-pair BLS12-381 pairing check shared by single
+        /// and batched verification.
+        pub(crate) fn verify_pairing(
+            opening_key: &OpeningKey,
+            left_projective: G1Projective,
+            right_projective: G1Projective,
+        ) -> Result<(), Error> {
+            let projectives = [left_projective, right_projective];
+            let mut affines = [G1Affine::identity(); 2];
+            G1Projective::batch_normalize(&projectives, &mut affines);
+
+            let pairing = dusk_bls12_381::multi_miller_loop(&[
+                (&affines[0], &opening_key.prepared_x_h),
+                (&affines[1], &opening_key.prepared_h),
+            ])
+            .final_exponentiation();
+
+            if pairing != dusk_bls12_381::Gt::identity() {
+                return Err(Error::ProofVerificationError);
+            }
+
+            Ok(())
+        }
+
         #[allow(non_snake_case)]
         fn prepare_with_ref(
             &self,
@@ -698,21 +810,7 @@ pub(crate) mod alloc {
                 );
             }
 
-            let projectives = [left_projective, right_projective];
-            let mut affines = [G1Affine::identity(); 2];
-            G1Projective::batch_normalize(&projectives, &mut affines);
-
-            let pairing = dusk_bls12_381::multi_miller_loop(&[
-                (&affines[0], &opening_key.prepared_x_h),
-                (&affines[1], &opening_key.prepared_h),
-            ])
-            .final_exponentiation();
-
-            if pairing != dusk_bls12_381::Gt::identity() {
-                return Err(Error::ProofVerificationError);
-            }
-
-            Ok(())
+            Self::verify_pairing(opening_key, left_projective, right_projective)
         }
 
         /// Reconstruct the pre-regrouping linearization commitment directly
@@ -1620,6 +1718,15 @@ mod soundness_tests {
              q_arith_eval, q_c_eval, q_l_eval, and q_r_eval are \
              not bound by the batch opening proof, allowing a \
              malicious prover to forge them after seeing z_challenge."
+        );
+        assert!(
+            verifier
+                .verify_batch(&[
+                    (&honest_proof, &honest_pi),
+                    (&forged_proof, &forged_pi),
+                ])
+                .is_err(),
+            "forged selector-eval proof must also be rejected in verify_batch"
         );
     }
 }

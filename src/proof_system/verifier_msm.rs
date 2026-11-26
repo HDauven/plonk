@@ -487,6 +487,254 @@ pub(crate) fn verifier_msm_single(
     }
 }
 
+/// Maximum active point count handled by Straus wNAF before switching to
+/// signed-digit Pippenger.
+const STRAUS_MAX_POINTS: usize = 48;
+
+/// Select the Pippenger window width `c` for `n` active points.
+fn pippenger_window_bits(n: usize) -> usize {
+    #[cfg(not(feature = "std"))]
+    {
+        if n < 256 { 5 } else { 6 }
+    }
+    #[cfg(feature = "std")]
+    {
+        match n {
+            0..=95 => 5,
+            96..=255 => 6,
+            256..=767 => 7,
+            768..=2047 => 8,
+            2048..=6143 => 9,
+            _ => 10,
+        }
+    }
+}
+
+/// Extract `c` bits starting at `bit_offset` from little-endian 64-bit limbs.
+#[inline]
+fn extract_window_bits(limbs: &[u64; 4], bit_offset: usize, mask: u64) -> u64 {
+    let limb_idx = bit_offset / 64;
+    let bit_idx = bit_offset % 64;
+    if limb_idx >= 4 {
+        return 0;
+    }
+    let mut bits = limbs[limb_idx] >> bit_idx;
+    if bit_idx > 0 && limb_idx + 1 < 4 {
+        bits |= limbs[limb_idx + 1] << (64 - bit_idx);
+    }
+    bits & mask
+}
+
+/// Evaluate a variable-base MSM over non-identity points with non-trivial
+/// public scalars using signed-digit (Booth) Pippenger.
+///
+/// With `c >= 2`, `num_windows = ceil(256 / c)`, and `half = 1 << (c - 1)`,
+/// every canonical `BlsScalar < 2^255` has top window value at most `half`,
+/// guaranteeing zero terminal carry under the `val > half` recoding rule.
+fn signed_pippenger(pts: &[G1Affine], scs: &[BlsScalar]) -> G1Projective {
+    let n = pts.len();
+    debug_assert_eq!(n, scs.len());
+    if n == 0 {
+        return G1Projective::identity();
+    }
+
+    let c = pippenger_window_bits(n);
+    let num_windows = 256usize.div_ceil(c);
+    let radix = 1i32 << c;
+    let half = radix >> 1;
+    let mask = (1u64 << c) - 1;
+    let num_buckets = half as usize;
+
+    // Store signed digits window-major (`digits[w * n + i]`) so each window's
+    // bucket pass streams sequentially with zero cross-thread false sharing.
+    let mut digits = alloc::vec![0i16; num_windows * n];
+    for (p_idx, sc) in scs.iter().enumerate() {
+        let limbs = scalar_to_le_limbs(sc);
+        let mut carry = 0i32;
+        for w in 0..num_windows {
+            let raw = extract_window_bits(&limbs, w * c, mask) as i32;
+            let val = raw + carry;
+            let digit = if val > half {
+                carry = 1;
+                val - radix
+            } else {
+                carry = 0;
+                val
+            };
+            digits[w * n + p_idx] = digit as i16;
+        }
+        debug_assert_eq!(carry, 0);
+    }
+
+    let eval_window_with_buf =
+        |w: usize, buckets: &mut [G1Projective]| -> G1Projective {
+            buckets.fill(G1Projective::identity());
+            let row = &digits[w * n..(w + 1) * n];
+            for (pt, &d) in pts.iter().zip(row.iter()) {
+                if d > 0 {
+                    let bucket = &mut buckets[(d as usize) - 1];
+                    if bool::from(bucket.is_identity()) {
+                        *bucket = G1Projective::from(pt);
+                    } else {
+                        *bucket = bucket.add_mixed(pt);
+                    }
+                } else if d < 0 {
+                    let bucket = &mut buckets[((-d) as usize) - 1];
+                    let neg_pt = -*pt;
+                    if bool::from(bucket.is_identity()) {
+                        *bucket = G1Projective::from(&neg_pt);
+                    } else {
+                        *bucket = bucket.add_mixed(&neg_pt);
+                    }
+                }
+            }
+
+            let mut running = G1Projective::identity();
+            let mut window_sum = G1Projective::identity();
+            for bucket in buckets.iter().rev() {
+                if !bool::from(bucket.is_identity()) {
+                    running += bucket;
+                }
+                if !bool::from(running.is_identity()) {
+                    window_sum += running;
+                }
+            }
+            window_sum
+        };
+
+    #[cfg(feature = "std")]
+    let window_sums: Vec<G1Projective> = if rayon::current_num_threads() > 1 {
+        use rayon::prelude::*;
+
+        // Coarsen window ranges so each worker amortizes scheduling overhead
+        // and reuses one L1-resident bucket buffer across its windows.
+        const TARGET_OPS_PER_TASK: usize = 1600;
+        let ops_per_window = n + 2 * num_buckets;
+        let windows_per_task =
+            TARGET_OPS_PER_TASK.div_ceil(ops_per_window).max(1);
+        let num_tasks = num_windows
+            .div_ceil(windows_per_task)
+            .min(rayon::current_num_threads());
+        let chunk_windows = num_windows.div_ceil(num_tasks);
+
+        let mut sums = alloc::vec![G1Projective::identity(); num_windows];
+        sums.par_chunks_mut(chunk_windows).enumerate().for_each(
+            |(chunk_idx, out)| {
+                let start_w = chunk_idx * chunk_windows;
+                let mut buckets =
+                    alloc::vec![G1Projective::identity(); num_buckets];
+                for (offset, slot) in out.iter_mut().enumerate() {
+                    *slot =
+                        eval_window_with_buf(start_w + offset, &mut buckets);
+                }
+            },
+        );
+        sums
+    } else {
+        let mut buckets = alloc::vec![G1Projective::identity(); num_buckets];
+        (0..num_windows)
+            .map(|w| eval_window_with_buf(w, &mut buckets))
+            .collect()
+    };
+
+    #[cfg(not(feature = "std"))]
+    let window_sums: Vec<G1Projective> = {
+        let mut buckets = alloc::vec![G1Projective::identity(); num_buckets];
+        (0..num_windows)
+            .map(|w| eval_window_with_buf(w, &mut buckets))
+            .collect()
+    };
+
+    let mut total = window_sums[num_windows - 1];
+    for w in (0..num_windows - 1).rev() {
+        for _ in 0..c {
+            total = total.double();
+        }
+        total += window_sums[w];
+    }
+    total
+}
+
+/// Evaluate a Straus wNAF MSM over non-identity points with non-trivial public
+/// scalars.
+fn straus_variable_base(pts: &[G1Affine], scs: &[BlsScalar]) -> G1Projective {
+    let n = pts.len();
+    if n == 0 {
+        return G1Projective::identity();
+    }
+    if n == 1 {
+        return scalar_mul_public(&pts[0], &scs[0]);
+    }
+
+    let eval_chunk = |chunk_pts: &[G1Affine], chunk_scs: &[BlsScalar]| {
+        let owned_tables =
+            build_odd_tables_batched::<DYNAMIC_ODD_COUNT>(chunk_pts);
+        let table_refs: Vec<&[G1Affine]> =
+            owned_tables.iter().map(|t| &t[..]).collect();
+        let m = chunk_pts.len();
+        let mut digits = alloc::vec![0i8; m * 256];
+        let mut lens = Vec::with_capacity(m);
+        for (i, sc) in chunk_scs.iter().enumerate() {
+            let slice: &mut [i8; 256] = (&mut digits[i * 256..(i + 1) * 256])
+                .try_into()
+                .expect("chunk is 256 bytes");
+            lens.push(encode_wnaf::<DYNAMIC_WNAF_WIDTH>(sc, slice));
+        }
+        straus_eval_slice(&table_refs, &digits, &lens)
+    };
+
+    #[cfg(feature = "std")]
+    if n >= 16 && rayon::current_num_threads() > 1 {
+        let mid = n / 2;
+        let (left, right) = rayon::join(
+            || eval_chunk(&pts[..mid], &scs[..mid]),
+            || eval_chunk(&pts[mid..], &scs[mid..]),
+        );
+        return left + right;
+    }
+
+    eval_chunk(pts, scs)
+}
+
+/// Variable-time variable-base G1 MSM for public verifier scalars.
+///
+/// Filters identity bases and zero scalars, folds `±1` directly without table
+/// setup, uses Straus wNAF for small inputs (`<= 48` active terms), and uses
+/// signed-digit Pippenger for larger batches.
+pub(crate) fn msm_public_variable_base(
+    points: &[G1Affine],
+    scalars: &[BlsScalar],
+) -> G1Projective {
+    assert_eq!(points.len(), scalars.len());
+
+    let mut pts = Vec::with_capacity(points.len());
+    let mut scs = Vec::with_capacity(scalars.len());
+    let mut unit_sum = G1Projective::identity();
+
+    for (pt, sc) in points.iter().zip(scalars.iter()) {
+        if bool::from(pt.is_identity()) || *sc == BlsScalar::zero() {
+            continue;
+        }
+        if *sc == BlsScalar::one() {
+            unit_sum = unit_sum.add_mixed(pt);
+        } else if *sc == -BlsScalar::one() {
+            unit_sum = unit_sum.add_mixed(&(-*pt));
+        } else {
+            pts.push(*pt);
+            scs.push(*sc);
+        }
+    }
+
+    let body = if pts.is_empty() {
+        G1Projective::identity()
+    } else if pts.len() <= STRAUS_MAX_POINTS {
+        straus_variable_base(&pts, &scs)
+    } else {
+        signed_pippenger(&pts, &scs)
+    };
+    unit_sum + body
+}
+
 #[cfg(test)]
 mod tests {
     use dusk_bls12_381::multiscalar_mul::msm_variable_base;
@@ -601,5 +849,38 @@ mod tests {
 
         assert_eq!(left, expected_left);
         assert_eq!(right, expected_right);
+    }
+
+    #[test]
+    fn msm_public_variable_base_matches_reference_across_regimes() {
+        let mut rng = StdRng::seed_from_u64(0xbadc_0ffe);
+        let edges = edge_scalars(&mut rng);
+
+        // Cover empty, unit, Straus (1, 17, 48), and Booth Pippenger across
+        // window widths c = 5 (49), c = 6 (130), c = 7 (320), c = 8 (800).
+        for count in [0usize, 1, 17, 48, 49, 130, 320, 800] {
+            let mut pts = Vec::with_capacity(count);
+            let mut scs = Vec::with_capacity(count);
+            for i in 0..count {
+                let pt = if i % 19 == 0 {
+                    G1Affine::identity()
+                } else {
+                    G1Affine::from(
+                        G1Projective::generator() * BlsScalar::random(&mut rng),
+                    )
+                };
+                let sc = if i < edges.len() {
+                    edges[i]
+                } else {
+                    BlsScalar::random(&mut rng)
+                };
+                pts.push(pt);
+                scs.push(sc);
+            }
+
+            let actual = msm_public_variable_base(&pts, &scs);
+            let expected = msm_variable_base(&pts, &scs);
+            assert_eq!(actual, expected, "mismatch for count={count}");
+        }
     }
 }

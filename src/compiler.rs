@@ -17,7 +17,7 @@ mod prover;
 mod verifier;
 
 pub use prover::Prover;
-pub use verifier::Verifier;
+pub use verifier::{BatchVerifier, Verifier};
 
 /// Version selector for proving and verification behavior.
 ///

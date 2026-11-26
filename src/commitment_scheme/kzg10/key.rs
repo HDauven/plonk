@@ -664,6 +664,19 @@ impl Serializable<{ G1Affine::SIZE + G2Affine::SIZE * 2 }> for OpeningKey {
 }
 
 impl OpeningKey {
+    /// Returns `true` if `self` and `other` share identical SRS opening
+    /// parameters `(g, h, x_h)`.
+    pub(crate) fn matches(&self, other: &Self) -> bool {
+        self.g == other.g && self.h == other.h && self.x_h == other.x_h
+    }
+
+    /// Absorbs `(g, h, x_h)` into a Fiat-Shamir transcript.
+    pub(crate) fn append_to_transcript(&self, transcript: &mut Transcript) {
+        transcript.append_message(b"ok_g", &self.g.to_bytes());
+        transcript.append_message(b"ok_h", &self.h.to_bytes());
+        transcript.append_message(b"ok_x_h", &self.x_h.to_bytes());
+    }
+
     pub(crate) fn try_new(
         g: G1Affine,
         h: G2Affine,

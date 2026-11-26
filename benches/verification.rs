@@ -40,6 +40,26 @@ fn verification_benchmark(c: &mut Criterion) {
     c.bench_function("Verify 32 public inputs", |b| {
         b.iter(|| verifier.verify(black_box(&proof), black_box(&public_inputs)))
     });
+
+    for batch_size in [16usize, 32, 64] {
+        let pairs: Vec<(Proof, Vec<BlsScalar>)> = (0..batch_size)
+            .map(|_| {
+                prover
+                    .prove(&mut rand_core::OsRng, &VerificationCircuit)
+                    .expect("failed to prove")
+            })
+            .collect();
+        let items: Vec<(&Proof, &[BlsScalar])> =
+            pairs.iter().map(|(p, pi)| (p, pi.as_slice())).collect();
+        verifier
+            .verify_batch(&items)
+            .expect("failed to batch verify proofs");
+
+        let name = format!("Verify batch {batch_size} (32 public inputs)");
+        c.bench_function(&name, |b| {
+            b.iter(|| verifier.verify_batch(black_box(&items)))
+        });
+    }
 }
 
 criterion_group! {

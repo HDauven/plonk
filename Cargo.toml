@@ -105,6 +105,10 @@ name = "assert_scalar"
 required-features = ["alloc"]
 
 [[test]]
+name = "batch_verification"
+required-features = ["alloc"]
+
+[[test]]
 name = "boolean"
 required-features = ["alloc"]
 

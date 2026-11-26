@@ -14,8 +14,10 @@ use super::PlonkVersion;
 use crate::commitment_scheme::OpeningKey;
 use crate::error::Error;
 use crate::fft::EvaluationDomain;
+use crate::proof_system::proof::alloc::PreparedVerification;
 use crate::proof_system::verifier_msm::{
-    STATIC_POINT_COUNT, StaticVerifierTables,
+    DYNAMIC_POINT_COUNT, STATIC_POINT_COUNT, StaticVerifierTables,
+    msm_public_variable_base,
 };
 use crate::proof_system::{Proof, VerifierKey};
 use crate::transcript::TranscriptProtocol;
@@ -312,11 +314,470 @@ impl Verifier {
         }
     }
 
+    /// Verify a batch of proofs for this circuit using the current (latest)
+    /// verification behavior.
+    ///
+    /// Shares a single BLS12-381 pairing check and merges the 16 static
+    /// verifier commitments across the batch. Returns `Ok(())` when `items` is
+    /// empty or every proof is valid.
+    pub fn verify_batch<P>(&self, items: &[(&Proof, P)]) -> Result<(), Error>
+    where
+        P: AsRef<[BlsScalar]> + Sync,
+    {
+        self.verify_batch_with_version(items, PlonkVersion::current())
+    }
+
+    /// Verify a batch of proofs for this circuit using an explicitly selected
+    /// version.
+    ///
+    /// Shares a single BLS12-381 pairing check and merges the 16 static
+    /// verifier commitments across the batch. Returns `Ok(())` when `items` is
+    /// empty or every proof is valid.
+    pub fn verify_batch_with_version<P>(
+        &self,
+        items: &[(&Proof, P)],
+        version: PlonkVersion,
+    ) -> Result<(), Error>
+    where
+        P: AsRef<[BlsScalar]> + Sync,
+    {
+        if items.is_empty() {
+            return Ok(());
+        }
+        if items.len() == 1 {
+            return self.verify_with_version(
+                items[0].0,
+                items[0].1.as_ref(),
+                version,
+            );
+        }
+
+        for (_, pi) in items {
+            let pi = pi.as_ref();
+            if pi.len() != self.public_input_indexes.len() {
+                return Err(Error::InconsistentPublicInputsLen {
+                    expected: self.public_input_indexes.len(),
+                    provided: pi.len(),
+                });
+            }
+        }
+
+        let mut batch_transcript =
+            Transcript::new(b"dusk-plonk-verify-batch-v1");
+        self.opening_key.append_to_transcript(&mut batch_transcript);
+        batch_transcript.append_u64(b"version", version_tag(version));
+        self.append_context_to_batch_transcript(&mut batch_transcript);
+        batch_transcript.append_u64(b"batch-len", items.len() as u64);
+        for (proof, pi) in items {
+            proof.append_to_batch_transcript(&mut batch_transcript);
+            let pi = pi.as_ref();
+            batch_transcript.append_u64(b"pi-len", pi.len() as u64);
+            for scalar in pi {
+                batch_transcript.append_scalar(b"pi", scalar);
+            }
+        }
+        let rhos = sample_batch_randomizers(&mut batch_transcript, items.len());
+
+        let prepared = self.prepare_batch_items(items, version)?;
+
+        let mut merged_static = [BlsScalar::zero(); STATIC_POINT_COUNT];
+        let mut left_pts = Vec::with_capacity(2 * items.len());
+        let mut left_scs = Vec::with_capacity(2 * items.len());
+        let mut right_pts = Vec::with_capacity(
+            STATIC_POINT_COUNT + DYNAMIC_POINT_COUNT * items.len(),
+        );
+        let mut right_scs = Vec::with_capacity(
+            STATIC_POINT_COUNT + DYNAMIC_POINT_COUNT * items.len(),
+        );
+
+        right_pts.extend_from_slice(&self.static_points);
+        right_scs.resize(STATIC_POINT_COUNT, BlsScalar::zero());
+
+        for (prep, &rho) in prepared.iter().zip(rhos.iter()) {
+            if rho == BlsScalar::one() {
+                for (dst, src) in
+                    merged_static.iter_mut().zip(prep.static_scalars.iter())
+                {
+                    *dst += *src;
+                }
+                left_pts.push(prep.w_z);
+                left_scs.push(BlsScalar::one());
+                left_pts.push(prep.w_zw);
+                left_scs.push(prep.u_challenge);
+                right_pts.extend_from_slice(&prep.dynamic_points);
+                right_scs.extend_from_slice(&prep.dynamic_scalars);
+            } else {
+                for (dst, src) in
+                    merged_static.iter_mut().zip(prep.static_scalars.iter())
+                {
+                    *dst += rho * *src;
+                }
+                left_pts.push(prep.w_z);
+                left_scs.push(rho);
+                left_pts.push(prep.w_zw);
+                left_scs.push(rho * prep.u_challenge);
+                right_pts.extend_from_slice(&prep.dynamic_points);
+                for sc in &prep.dynamic_scalars {
+                    right_scs.push(rho * *sc);
+                }
+            }
+        }
+        right_scs[..STATIC_POINT_COUNT].copy_from_slice(&merged_static);
+
+        let left = -msm_public_variable_base(&left_pts, &left_scs);
+        let right = msm_public_variable_base(&right_pts, &right_scs);
+        Proof::verify_pairing(&self.opening_key, left, right)
+    }
+
+    fn prepare_one(
+        &self,
+        proof: &Proof,
+        public_inputs: &[BlsScalar],
+        version: PlonkVersion,
+    ) -> Result<PreparedVerification, Error> {
+        let mut transcript = self.transcript_for_version(version);
+        for pi in public_inputs {
+            transcript.append_scalar(b"pi", pi);
+        }
+        let bind_selectors = !matches!(version, PlonkVersion::V1);
+        proof.prepare_verification(
+            &mut transcript,
+            &self.domain,
+            &self.public_input_roots,
+            public_inputs,
+            bind_selectors,
+        )
+    }
+
+    fn prepare_batch_items<P>(
+        &self,
+        items: &[(&Proof, P)],
+        version: PlonkVersion,
+    ) -> Result<Vec<PreparedVerification>, Error>
+    where
+        P: AsRef<[BlsScalar]> + Sync,
+    {
+        #[cfg(feature = "std")]
+        if items.len() >= 16 && rayon::current_num_threads() > 1 {
+            use rayon::prelude::*;
+
+            return items
+                .par_iter()
+                .with_min_len(8)
+                .map(|(proof, pi)| {
+                    self.prepare_one(proof, pi.as_ref(), version)
+                })
+                .collect();
+        }
+
+        items
+            .iter()
+            .map(|(proof, pi)| self.prepare_one(proof, pi.as_ref(), version))
+            .collect()
+    }
+
+    fn append_context_to_batch_transcript(&self, transcript: &mut Transcript) {
+        transcript.append_message(b"label", &self.label);
+        transcript.append_u64(b"constraints", self.constraints as u64);
+        transcript
+            .append_u64(b"pi-idx-len", self.public_input_indexes.len() as u64);
+        for &idx in &self.public_input_indexes {
+            transcript.append_u64(b"pi-idx", idx as u64);
+        }
+        self.verifier_key.seed_transcript(transcript);
+    }
+
     fn transcript_for_version(&self, version: PlonkVersion) -> Transcript {
         match version {
             PlonkVersion::V1 | PlonkVersion::V2 => self.transcript.clone(),
             PlonkVersion::V3 => self.transcript_v3.clone(),
         }
+    }
+}
+
+const fn version_tag(version: PlonkVersion) -> u64 {
+    match version {
+        PlonkVersion::V1 => 1,
+        PlonkVersion::V2 => 2,
+        PlonkVersion::V3 => 3,
+    }
+}
+
+fn sample_batch_randomizers(
+    transcript: &mut Transcript,
+    count: usize,
+) -> Vec<BlsScalar> {
+    let mut rhos = Vec::with_capacity(count);
+    if count == 0 {
+        return rhos;
+    }
+    rhos.push(BlsScalar::one());
+    for _ in 1..count {
+        let mut rho = transcript.challenge_scalar(b"batch-rho");
+        while rho == BlsScalar::zero() {
+            rho = transcript.challenge_scalar(b"batch-rho");
+        }
+        rhos.push(rho);
+    }
+    rhos
+}
+
+struct BatchEntry<'a> {
+    verifier: &'a Verifier,
+    proof: &'a Proof,
+    public_inputs: &'a [BlsScalar],
+    version: PlonkVersion,
+}
+
+/// Accumulates proofs across one or more [`Verifier`] instances that share the
+/// same SRS opening key and verifies them together in a single batched
+/// multi-scalar multiplication and BLS12-381 pairing check.
+///
+/// Proofs sharing the same circuit verification key automatically fold their
+/// static verifier-key commitments together, while all proofs across all
+/// circuits share the opening-key generator and a single 2-pair pairing.
+#[derive(Default)]
+pub struct BatchVerifier<'a> {
+    opening_key: Option<&'a OpeningKey>,
+    entries: Vec<BatchEntry<'a>>,
+}
+
+impl<'a> BatchVerifier<'a> {
+    /// Creates an empty batch verifier.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates an empty batch verifier with preallocated entry capacity.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            opening_key: None,
+            entries: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Returns the number of proofs currently queued in the batch.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns `true` if no proofs have been pushed to the batch.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Adds a proof and its public inputs for `verifier` using
+    /// [`PlonkVersion::current`].
+    ///
+    /// Returns [`Error::InconsistentPublicInputsLen`] if `public_inputs` does
+    /// not match `verifier`, or [`Error::IncompatibleOpeningKey`] if
+    /// `verifier` uses a different SRS opening key than previously pushed
+    /// verifiers.
+    pub fn push(
+        &mut self,
+        verifier: &'a Verifier,
+        proof: &'a Proof,
+        public_inputs: &'a [BlsScalar],
+    ) -> Result<(), Error> {
+        self.push_with_version(
+            verifier,
+            proof,
+            public_inputs,
+            PlonkVersion::current(),
+        )
+    }
+
+    /// Adds a proof and its public inputs for `verifier` under an explicitly
+    /// selected [`PlonkVersion`].
+    ///
+    /// Returns [`Error::InconsistentPublicInputsLen`] if `public_inputs` does
+    /// not match `verifier`, or [`Error::IncompatibleOpeningKey`] if
+    /// `verifier` uses a different SRS opening key than previously pushed
+    /// verifiers.
+    pub fn push_with_version(
+        &mut self,
+        verifier: &'a Verifier,
+        proof: &'a Proof,
+        public_inputs: &'a [BlsScalar],
+        version: PlonkVersion,
+    ) -> Result<(), Error> {
+        if public_inputs.len() != verifier.public_input_indexes.len() {
+            return Err(Error::InconsistentPublicInputsLen {
+                expected: verifier.public_input_indexes.len(),
+                provided: public_inputs.len(),
+            });
+        }
+
+        match self.opening_key {
+            Some(existing) if !existing.matches(&verifier.opening_key) => {
+                return Err(Error::IncompatibleOpeningKey);
+            }
+            None => self.opening_key = Some(&verifier.opening_key),
+            Some(_) => {}
+        }
+
+        self.entries.push(BatchEntry {
+            verifier,
+            proof,
+            public_inputs,
+            version,
+        });
+        Ok(())
+    }
+
+    /// Verifies all queued proofs in a single batched check.
+    ///
+    /// Returns `Ok(())` when the batch is empty or every queued proof is
+    /// valid, or [`Error::ProofVerificationError`] if any proof fails.
+    pub fn verify(self) -> Result<(), Error> {
+        const VK_STATIC_COUNT: usize = STATIC_POINT_COUNT - 1;
+
+        if self.entries.is_empty() {
+            return Ok(());
+        }
+        if self.entries.len() == 1 {
+            let entry = &self.entries[0];
+            return entry.verifier.verify_with_version(
+                entry.proof,
+                entry.public_inputs,
+                entry.version,
+            );
+        }
+
+        let opening_key = self
+            .opening_key
+            .expect("non-empty batch has a validated opening key");
+
+        let mut batch_transcript =
+            Transcript::new(b"dusk-plonk-batch-verifier-v1");
+        opening_key.append_to_transcript(&mut batch_transcript);
+        batch_transcript.append_u64(b"batch-len", self.entries.len() as u64);
+        for entry in &self.entries {
+            batch_transcript.append_u64(b"version", version_tag(entry.version));
+            entry
+                .verifier
+                .append_context_to_batch_transcript(&mut batch_transcript);
+            entry
+                .proof
+                .append_to_batch_transcript(&mut batch_transcript);
+            batch_transcript
+                .append_u64(b"pi-len", entry.public_inputs.len() as u64);
+            for scalar in entry.public_inputs {
+                batch_transcript.append_scalar(b"pi", scalar);
+            }
+        }
+        let rhos =
+            sample_batch_randomizers(&mut batch_transcript, self.entries.len());
+
+        let prepare_entry = |entry: &BatchEntry<'a>| {
+            entry.verifier.prepare_one(
+                entry.proof,
+                entry.public_inputs,
+                entry.version,
+            )
+        };
+
+        #[cfg(feature = "std")]
+        let prepared: Vec<PreparedVerification> =
+            if self.entries.len() >= 16 && rayon::current_num_threads() > 1 {
+                use rayon::prelude::*;
+
+                self.entries
+                    .par_iter()
+                    .with_min_len(8)
+                    .map(prepare_entry)
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                self.entries
+                    .iter()
+                    .map(prepare_entry)
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+
+        #[cfg(not(feature = "std"))]
+        let prepared: Vec<PreparedVerification> = self
+            .entries
+            .iter()
+            .map(prepare_entry)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut vk_groups: Vec<(
+            &'a VerifierKey,
+            &'a [G1Affine; STATIC_POINT_COUNT],
+            [BlsScalar; VK_STATIC_COUNT],
+        )> = Vec::new();
+        let mut g_scalar = BlsScalar::zero();
+
+        let mut left_pts = Vec::with_capacity(2 * self.entries.len());
+        let mut left_scs = Vec::with_capacity(2 * self.entries.len());
+        let mut right_pts = Vec::with_capacity(
+            STATIC_POINT_COUNT + DYNAMIC_POINT_COUNT * self.entries.len(),
+        );
+        let mut right_scs = Vec::with_capacity(
+            STATIC_POINT_COUNT + DYNAMIC_POINT_COUNT * self.entries.len(),
+        );
+
+        for ((entry, prep), &rho) in
+            self.entries.iter().zip(prepared.iter()).zip(rhos.iter())
+        {
+            let group_idx = if let Some(idx) = vk_groups
+                .iter()
+                .position(|(vk, _, _)| **vk == entry.verifier.verifier_key)
+            {
+                idx
+            } else {
+                vk_groups.push((
+                    &entry.verifier.verifier_key,
+                    &entry.verifier.static_points,
+                    [BlsScalar::zero(); VK_STATIC_COUNT],
+                ));
+                vk_groups.len() - 1
+            };
+
+            let group_scalars = &mut vk_groups[group_idx].2;
+            if rho == BlsScalar::one() {
+                for (dst, src) in group_scalars
+                    .iter_mut()
+                    .zip(prep.static_scalars[..VK_STATIC_COUNT].iter())
+                {
+                    *dst += *src;
+                }
+                g_scalar += prep.static_scalars[VK_STATIC_COUNT];
+                left_pts.push(prep.w_z);
+                left_scs.push(BlsScalar::one());
+                left_pts.push(prep.w_zw);
+                left_scs.push(prep.u_challenge);
+                right_pts.extend_from_slice(&prep.dynamic_points);
+                right_scs.extend_from_slice(&prep.dynamic_scalars);
+            } else {
+                for (dst, src) in group_scalars
+                    .iter_mut()
+                    .zip(prep.static_scalars[..VK_STATIC_COUNT].iter())
+                {
+                    *dst += rho * *src;
+                }
+                g_scalar += rho * prep.static_scalars[VK_STATIC_COUNT];
+                left_pts.push(prep.w_z);
+                left_scs.push(rho);
+                left_pts.push(prep.w_zw);
+                left_scs.push(rho * prep.u_challenge);
+                right_pts.extend_from_slice(&prep.dynamic_points);
+                for sc in &prep.dynamic_scalars {
+                    right_scs.push(rho * *sc);
+                }
+            }
+        }
+
+        for (_, static_pts, scalars) in &vk_groups {
+            right_pts.extend_from_slice(&static_pts[..VK_STATIC_COUNT]);
+            right_scs.extend_from_slice(scalars);
+        }
+        right_pts.push(opening_key.g);
+        right_scs.push(g_scalar);
+
+        let left = -msm_public_variable_base(&left_pts, &left_scs);
+        let right = msm_public_variable_base(&right_pts, &right_scs);
+        Proof::verify_pairing(opening_key, left, right)
     }
 }
 
@@ -578,5 +1039,117 @@ mod tests {
         decoded
             .verify(&proof, &public_inputs)
             .expect("decoded verifier should verify the proof");
+    }
+
+    #[test]
+    fn batch_verification_rejects_cancelling_invalid_proofs() {
+        // Construct two invalid proofs whose individual pairing defects cancel
+        // if summed with equal weights (P1 = valid + delta*G, P2 = valid -
+        // delta*G). Independent Fiat-Shamir randomizers must still
+        // reject the pair.
+        use dusk_bls12_381::G1Projective;
+
+        let mut rng = StdRng::seed_from_u64(0xca0c_e101);
+        let pp = PublicParameters::setup(1 << 5, &mut rng).expect("setup");
+        let (prover, verifier) =
+            Compiler::compile::<PublicInputCircuit>(&pp, b"cancel-pair")
+                .expect("compile");
+        let (proof, pi) =
+            prover.prove(&mut rng, &PublicInputCircuit).expect("prove");
+
+        let delta = G1Projective::generator() * BlsScalar::from(12345u64);
+        let mut p_plus = proof.clone();
+        p_plus.a_comm = Commitment(G1Affine::from(
+            G1Projective::from(proof.a_comm.0) + delta,
+        ));
+        let mut p_minus = proof;
+        p_minus.a_comm = Commitment(G1Affine::from(
+            G1Projective::from(p_minus.a_comm.0) - delta,
+        ));
+
+        assert_eq!(
+            verifier.verify(&p_plus, &pi),
+            Err(Error::ProofVerificationError)
+        );
+        assert_eq!(
+            verifier.verify(&p_minus, &pi),
+            Err(Error::ProofVerificationError)
+        );
+        assert_eq!(
+            verifier.verify_batch(&[(&p_plus, &pi), (&p_minus, &pi)]),
+            Err(Error::ProofVerificationError)
+        );
+
+        let mut batch = BatchVerifier::new();
+        batch.push(&verifier, &p_plus, &pi).unwrap();
+        batch.push(&verifier, &p_minus, &pi).unwrap();
+        assert_eq!(batch.verify(), Err(Error::ProofVerificationError));
+    }
+
+    #[test]
+    fn batch_transcript_binds_every_proof_field() {
+        use dusk_bls12_381::G1Projective;
+
+        let base = Proof::default();
+        let challenge_for = |proof: &Proof| {
+            let mut t = Transcript::new(b"field-binding-test");
+            proof.append_to_batch_transcript(&mut t);
+            t.challenge_scalar(b"out")
+        };
+        let baseline = challenge_for(&base);
+        let g = Commitment(G1Affine::from(G1Projective::generator()));
+        let one = BlsScalar::one();
+
+        let mut mutated_proofs = Vec::new();
+        macro_rules! push_comm_mutation {
+            ($field:ident) => {{
+                let mut p = base.clone();
+                p.$field = g;
+                mutated_proofs.push((stringify!($field), p));
+            }};
+        }
+        macro_rules! push_eval_mutation {
+            ($field:ident) => {{
+                let mut p = base.clone();
+                p.evaluations.$field = one;
+                mutated_proofs.push((stringify!($field), p));
+            }};
+        }
+
+        push_comm_mutation!(a_comm);
+        push_comm_mutation!(b_comm);
+        push_comm_mutation!(c_comm);
+        push_comm_mutation!(d_comm);
+        push_comm_mutation!(z_comm);
+        push_comm_mutation!(t_low_comm);
+        push_comm_mutation!(t_mid_comm);
+        push_comm_mutation!(t_high_comm);
+        push_comm_mutation!(t_fourth_comm);
+        push_comm_mutation!(w_z_chall_comm);
+        push_comm_mutation!(w_z_chall_w_comm);
+        push_eval_mutation!(a_eval);
+        push_eval_mutation!(b_eval);
+        push_eval_mutation!(c_eval);
+        push_eval_mutation!(d_eval);
+        push_eval_mutation!(a_w_eval);
+        push_eval_mutation!(b_w_eval);
+        push_eval_mutation!(d_w_eval);
+        push_eval_mutation!(q_arith_eval);
+        push_eval_mutation!(q_c_eval);
+        push_eval_mutation!(q_l_eval);
+        push_eval_mutation!(q_r_eval);
+        push_eval_mutation!(s_sigma_1_eval);
+        push_eval_mutation!(s_sigma_2_eval);
+        push_eval_mutation!(s_sigma_3_eval);
+        push_eval_mutation!(z_eval);
+
+        assert_eq!(mutated_proofs.len(), 26);
+        for (name, mutated) in mutated_proofs {
+            assert_ne!(
+                challenge_for(&mutated),
+                baseline,
+                "batch transcript did not bind proof field {name}"
+            );
+        }
     }
 }
