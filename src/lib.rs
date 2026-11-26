@@ -71,8 +71,14 @@ if #[cfg(feature = "alloc")] {
 
 });
 
+#[cfg(feature = "blst-backend")]
+pub(crate) mod blst_backend;
 #[cfg(feature = "debug")]
 pub(crate) mod debugger;
+#[cfg(feature = "std")]
+pub(crate) mod fast_fr;
+#[cfg(feature = "std")]
+pub(crate) mod fast_quotient;
 
 #[cfg(feature = "rkyv-impl")]
 mod archive;

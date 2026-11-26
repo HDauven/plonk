@@ -19,9 +19,9 @@ use crate::compiler::prover::linearization_poly::ProofEvaluations;
 use crate::error::Error;
 use crate::fft::{EvaluationDomain, Polynomial};
 use crate::proof_system::proof::Proof;
-use crate::proof_system::{
-    ProverKey, VerifierKey, linearization_poly, quotient_poly,
-};
+#[cfg(not(feature = "std"))]
+use crate::proof_system::quotient_poly;
+use crate::proof_system::{ProverKey, VerifierKey, linearization_poly};
 use crate::transcript::TranscriptProtocol;
 use crate::util::batch_inversion;
 
@@ -34,12 +34,20 @@ pub struct Prover {
     label: Vec<u8>,
     pub(crate) prover_key: ProverKey,
     pub(crate) commit_key: CommitKey,
+    #[cfg(feature = "blst-backend")]
+    blst_powers: alloc::sync::Arc<Vec<blst::blst_p1_affine>>,
+    #[cfg(feature = "blst-backend")]
+    blst_lagrange_powers: alloc::sync::Arc<Vec<blst::blst_p1_affine>>,
     pub(crate) verifier_key: VerifierKey,
     pub(crate) transcript: Transcript,
     sigma_evaluations: [Vec<BlsScalar>; 4],
     domain: EvaluationDomain,
+    #[cfg_attr(feature = "std", allow(dead_code))]
     quotient_domain: EvaluationDomain,
+    #[cfg_attr(feature = "std", allow(dead_code))]
     vanishing_coset_inverses: [BlsScalar; 8],
+    #[cfg(feature = "std")]
+    fast_cache: crate::fast_quotient::FastProverCache,
     pub(crate) size: usize,
     pub(crate) constraints: usize,
     public_input_indexes: Vec<usize>,
@@ -115,16 +123,42 @@ impl Prover {
             domain.fft(&prover_key.permutation.s_sigma_4.0),
         ];
 
+        #[cfg(feature = "std")]
+        let fast_cache = crate::fast_quotient::FastProverCache::new(
+            &domain,
+            &quotient_domain,
+            &prover_key,
+            &vanishing_coset_inverses,
+        );
+
+        #[cfg(feature = "blst-backend")]
+        let blst_powers = alloc::sync::Arc::new(
+            crate::blst_backend::g1_affines_to_blst(&commit_key.powers_of_g),
+        );
+        #[cfg(feature = "blst-backend")]
+        let blst_lagrange_powers =
+            alloc::sync::Arc::new(if blst_powers.len() >= size {
+                crate::blst_backend::g1_ifft_blst(&blst_powers[..size], &domain)
+            } else {
+                Vec::new()
+            });
+
         Ok(Self {
             label,
             prover_key,
             commit_key,
+            #[cfg(feature = "blst-backend")]
+            blst_powers,
+            #[cfg(feature = "blst-backend")]
+            blst_lagrange_powers,
             verifier_key,
             transcript,
             sigma_evaluations,
             domain,
             quotient_domain,
             vanishing_coset_inverses,
+            #[cfg(feature = "std")]
+            fast_cache,
             size,
             constraints,
             public_input_indexes,
@@ -139,6 +173,7 @@ impl Prover {
     /// if hiding degree = 1: (b2*X^(n+1) + b1*X^n - b2*X - b1) + witnesses
     /// if hiding degree = 2: (b3*X^(n+2) + b2*X^(n+1) + b1*X^n - b3*X^2 - b2*X
     /// - b1) + witnesses
+    #[cfg_attr(feature = "std", allow(dead_code))]
     pub(crate) fn blind_poly<R>(
         rng: &mut R,
         witnesses: &[BlsScalar],
@@ -156,6 +191,7 @@ impl Prover {
         )
     }
 
+    #[cfg_attr(feature = "std", allow(dead_code))]
     fn blind_poly_with_blinders(
         witnesses: &[BlsScalar],
         blinders: &[BlsScalar],
@@ -186,6 +222,7 @@ impl Prover {
         core::array::from_fn(|_| BlsScalar::random(&mut *rng))
     }
 
+    #[cfg_attr(feature = "std", allow(dead_code))]
     fn blind_wire_polynomials(
         witnesses: [&[BlsScalar]; 4],
         blinders: &[BlsScalar; 11],
@@ -254,28 +291,66 @@ impl Prover {
         core::array::from_fn(|i| targets[i].0.evaluate(&targets[i].1))
     }
 
-    fn commit_polynomials(
-        &self,
-        polynomials: [&Polynomial; 4],
-    ) -> Result<[Commitment; 4], Error> {
-        #[cfg(feature = "std")]
+    fn commit_one(&self, polynomial: &Polynomial) -> Result<Commitment, Error> {
+        #[cfg(feature = "blst-backend")]
         {
-            let commit = |i: usize| self.commit_key.commit(polynomials[i]);
-            let ((a, b), (c, d)) = rayon::join(
-                || rayon::join(|| commit(0), || commit(1)),
-                || rayon::join(|| commit(2), || commit(3)),
-            );
-            Ok([a?, b?, c?, d?])
+            if polynomial.degree() > self.commit_key.max_degree()
+                || polynomial.len() > self.blst_powers.len()
+            {
+                return Err(Error::PolynomialDegreeTooLarge);
+            }
+            Ok(Commitment::from(crate::blst_backend::msm_g1(
+                &self.blst_powers,
+                polynomial,
+            )))
+        }
+        #[cfg(not(feature = "blst-backend"))]
+        {
+            self.commit_key.commit(polynomial)
+        }
+    }
+
+    fn commit_polynomials<const K: usize>(
+        &self,
+        polynomials: [&Polynomial; K],
+    ) -> Result<[Commitment; K], Error> {
+        #[cfg(feature = "blst-backend")]
+        {
+            let max_degree = self.commit_key.max_degree();
+            let max_len = self.blst_powers.len();
+            for poly in &polynomials {
+                if poly.degree() > max_degree || poly.len() > max_len {
+                    return Err(Error::PolynomialDegreeTooLarge);
+                }
+            }
+            let raw = polynomials.map(|p| &p[..]);
+            let affines =
+                crate::blst_backend::msm_g1_batch(&self.blst_powers, raw);
+            Ok(affines.map(Commitment::from))
+        }
+
+        #[cfg(all(feature = "std", not(feature = "blst-backend")))]
+        {
+            use rayon::prelude::*;
+
+            let mut results: Vec<Result<Commitment, Error>> = polynomials
+                .par_iter()
+                .map(|poly| self.commit_key.commit(poly))
+                .collect();
+            let mut out = [Commitment::default(); K];
+            for (slot, res) in out.iter_mut().zip(results.drain(..)) {
+                *slot = res?;
+            }
+            Ok(out)
         }
 
         #[cfg(not(feature = "std"))]
         {
-            Ok([
-                self.commit_key.commit(polynomials[0])?,
-                self.commit_key.commit(polynomials[1])?,
-                self.commit_key.commit(polynomials[2])?,
-                self.commit_key.commit(polynomials[3])?,
-            ])
+            let mut out = [Commitment::default(); K];
+            for (slot, poly) in out.iter_mut().zip(polynomials.iter()) {
+                *slot = self.commit_key.commit(poly)?;
+            }
+            Ok(out)
         }
     }
 
@@ -561,7 +636,24 @@ impl Prover {
         C: Circuit,
         R: RngCore + CryptoRng,
     {
-        let prover = Composer::prove(self.constraints, circuit)?;
+        #[cfg(feature = "std")]
+        let prof = {
+            static ENABLED: std::sync::OnceLock<bool> =
+                std::sync::OnceLock::new();
+            *ENABLED.get_or_init(|| {
+                std::env::var_os("PLONK_STAGE_PROFILE").is_some()
+            })
+        };
+        #[cfg(feature = "std")]
+        let t_start = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
+        let prover = Composer::prove_fast(self.constraints, circuit)?;
+        #[cfg(feature = "std")]
+        let t_composer = t_start.map(|_| std::time::Instant::now());
 
         let size = self.size;
         let domain = self.domain;
@@ -597,29 +689,110 @@ impl Prover {
         let mut c_scalars = vec![BlsScalar::zero(); size];
         let mut d_scalars = vec![BlsScalar::zero(); size];
 
-        prover
-            .constraints
-            .iter()
-            .enumerate()
-            .for_each(|(i, constraint)| {
-                a_scalars[i] = prover[constraint.a];
-                b_scalars[i] = prover[constraint.b];
-                c_scalars[i] = prover[constraint.c];
-                d_scalars[i] = prover[constraint.d];
-            });
+        if prover.proving_only {
+            prover.wire_rows.iter().enumerate().for_each(
+                |(i, &[a, b, c, d])| {
+                    a_scalars[i] = prover[a];
+                    b_scalars[i] = prover[b];
+                    c_scalars[i] = prover[c];
+                    d_scalars[i] = prover[d];
+                },
+            );
+        } else {
+            prover.constraints.iter().enumerate().for_each(
+                |(i, constraint)| {
+                    a_scalars[i] = prover[constraint.a];
+                    b_scalars[i] = prover[constraint.b];
+                    c_scalars[i] = prover[constraint.c];
+                    d_scalars[i] = prover[constraint.d];
+                },
+            );
+        }
 
         let wire_blinders = Self::sample_wire_blinders(rng);
 
+        #[cfg(feature = "std")]
+        let [a_poly, b_poly, c_poly, d_poly] = {
+            let blinder_slices = [
+                &wire_blinders[..3],
+                &wire_blinders[3..6],
+                &wire_blinders[6..8],
+                &wire_blinders[8..],
+            ];
+            let witness_slices = [
+                a_scalars.as_slice(),
+                b_scalars.as_slice(),
+                c_scalars.as_slice(),
+                d_scalars.as_slice(),
+            ];
+            let blind_fast = |i: usize| {
+                let mut coeffs = crate::fast_fr::serial_ifft_bls_fast(
+                    witness_slices[i],
+                    &self.fast_cache.domain_ifft_roots,
+                    self.fast_cache.domain_size_inv,
+                    domain.log_size_of_group,
+                );
+                for (j, blinding_scalar) in
+                    blinder_slices[i].iter().copied().enumerate()
+                {
+                    coeffs[j] -= blinding_scalar;
+                    coeffs.push(blinding_scalar);
+                }
+                Polynomial::from_coefficients_vec(coeffs)
+            };
+            let ((a, b), (c, d)) = rayon::join(
+                || rayon::join(|| blind_fast(0), || blind_fast(1)),
+                || rayon::join(|| blind_fast(2), || blind_fast(3)),
+            );
+            [a, b, c, d]
+        };
+        #[cfg(not(feature = "std"))]
         let [a_poly, b_poly, c_poly, d_poly] = Self::blind_wire_polynomials(
             [&a_scalars, &b_scalars, &c_scalars, &d_scalars],
             &wire_blinders,
             &domain,
         );
+        #[cfg(feature = "std")]
+        let t_wire_ifft = t_start.map(|_| std::time::Instant::now());
 
         // commit to wire polynomials
         // ([a(x)]_1, [b(x)]_1, [c(x)]_1, [d(x)]_1)
+        #[cfg(feature = "blst-backend")]
+        let [a_comm, b_comm, c_comm, d_comm] = {
+            if self.blst_lagrange_powers.len() == size
+                && size + 3 <= self.blst_powers.len()
+                && a_poly.degree() <= self.commit_key.max_degree()
+                && b_poly.degree() <= self.commit_key.max_degree()
+                && c_poly.degree() <= self.commit_key.max_degree()
+                && d_poly.degree() <= self.commit_key.max_degree()
+            {
+                let blinder_slices = [
+                    &wire_blinders[..3],
+                    &wire_blinders[3..6],
+                    &wire_blinders[6..8],
+                    &wire_blinders[8..],
+                ];
+                let affines = crate::blst_backend::msm_g1_lagrange_batch(
+                    &self.blst_lagrange_powers,
+                    &self.blst_powers,
+                    [
+                        a_scalars.as_slice(),
+                        b_scalars.as_slice(),
+                        c_scalars.as_slice(),
+                        d_scalars.as_slice(),
+                    ],
+                    blinder_slices,
+                );
+                affines.map(Commitment::from)
+            } else {
+                self.commit_polynomials([&a_poly, &b_poly, &c_poly, &d_poly])?
+            }
+        };
+        #[cfg(not(feature = "blst-backend"))]
         let [a_comm, b_comm, c_comm, d_comm] =
             self.commit_polynomials([&a_poly, &b_poly, &c_poly, &d_poly])?;
+        #[cfg(feature = "std")]
+        let t_wire_msm = t_start.map(|_| std::time::Instant::now());
 
         // Add wire polynomial commitments to transcript
         transcript.append_commitment(b"a_comm", &a_comm);
@@ -649,8 +822,29 @@ impl Prover {
             .perm
             .compute_permutation_vec(&domain, wires, &beta, &gamma, sigma);
 
+        #[cfg(feature = "std")]
+        let z_poly = {
+            let blinders: [BlsScalar; 3] =
+                core::array::from_fn(|_| BlsScalar::random(&mut *rng));
+            let mut coeffs = crate::fast_fr::serial_ifft_bls_fast(
+                &permutation,
+                &self.fast_cache.domain_ifft_roots,
+                self.fast_cache.domain_size_inv,
+                domain.log_size_of_group,
+            );
+            for (j, blinding_scalar) in blinders.into_iter().enumerate() {
+                coeffs[j] -= blinding_scalar;
+                coeffs.push(blinding_scalar);
+            }
+            Polynomial::from_coefficients_vec(coeffs)
+        };
+        #[cfg(not(feature = "std"))]
         let z_poly = Self::blind_poly(rng, &permutation, 2, &domain);
-        let z_comm = self.commit_key.commit(&z_poly)?;
+        #[cfg(feature = "std")]
+        let t_perm = t_start.map(|_| std::time::Instant::now());
+        let z_comm = self.commit_one(&z_poly)?;
+        #[cfg(feature = "std")]
+        let t_z_msm = t_start.map(|_| std::time::Instant::now());
         transcript.append_commitment(b"z_comm", &z_comm);
 
         // round 3
@@ -675,7 +869,16 @@ impl Prover {
                 &public_inputs,
                 self.size,
             );
-            Polynomial::from_coefficients_vec(domain.ifft(&dense_public_inputs))
+            #[cfg(feature = "std")]
+            let coeffs = crate::fast_fr::serial_ifft_bls_fast(
+                &dense_public_inputs,
+                &self.fast_cache.domain_ifft_roots,
+                self.fast_cache.domain_size_inv,
+                domain.log_size_of_group,
+            );
+            #[cfg(not(feature = "std"))]
+            let coeffs = domain.ifft(&dense_public_inputs);
+            Polynomial::from_coefficients_vec(coeffs)
         };
 
         // compute quotient polynomial
@@ -689,24 +892,41 @@ impl Prover {
             fixed_base_sep_challenge,
             var_base_sep_challenge,
         );
-        let t_poly = quotient_poly::compute(
-            &self.quotient_domain,
-            &self.prover_key,
-            &z_poly,
-            wires,
-            &pi_poly,
-            &self.vanishing_coset_inverses,
-            args,
-        )?;
-
-        // Split at multiples of n. The first three chunks have degree at
-        // most n after blinding; the fourth can have degree n + 9.
-        let domain_size = domain.size();
-
-        let mut t_low_vec = t_poly[0..domain_size].to_vec();
-        let mut t_mid_vec = t_poly[domain_size..2 * domain_size].to_vec();
-        let mut t_high_vec = t_poly[2 * domain_size..3 * domain_size].to_vec();
-        let mut t_fourth_vec = t_poly[3 * domain_size..].to_vec();
+        #[cfg(feature = "std")]
+        let [
+            mut t_low_vec,
+            mut t_mid_vec,
+            mut t_high_vec,
+            mut t_fourth_vec,
+        ] = self
+            .fast_cache
+            .compute_split_quotient(&domain, &z_poly, wires, &pi_poly, args)?;
+        #[cfg(not(feature = "std"))]
+        let [
+            mut t_low_vec,
+            mut t_mid_vec,
+            mut t_high_vec,
+            mut t_fourth_vec,
+        ] = {
+            let t_poly = quotient_poly::compute(
+                &self.quotient_domain,
+                &self.prover_key,
+                &z_poly,
+                wires,
+                &pi_poly,
+                &self.vanishing_coset_inverses,
+                args,
+            )?;
+            let domain_size = domain.size();
+            [
+                t_poly[0..domain_size].to_vec(),
+                t_poly[domain_size..2 * domain_size].to_vec(),
+                t_poly[2 * domain_size..3 * domain_size].to_vec(),
+                t_poly[3 * domain_size..].to_vec(),
+            ]
+        };
+        #[cfg(feature = "std")]
+        let t_quot = t_start.map(|_| std::time::Instant::now());
 
         // select 3 blinding factors for the quotient splitted polynomials
         let b_12 = BlsScalar::random(&mut *rng);
@@ -740,6 +960,8 @@ impl Prover {
                 &t_high_poly,
                 &t_fourth_poly,
             ])?;
+        #[cfg(feature = "std")]
+        let t_quot_msm = t_start.map(|_| std::time::Instant::now());
 
         // add quotient polynomial commitments to transcript
         transcript.append_commitment(b"t_low_comm", &t_low_comm);
@@ -862,9 +1084,9 @@ impl Prover {
             &public_inputs,
         );
 
-        let compute_w_z = || -> Result<Commitment, Error> {
+        let build_w_z = || {
             // compute the opening proof polynomial 'W_z(X)'
-            let aggregate_witness = CommitKey::compute_aggregate_witness(
+            CommitKey::compute_aggregate_witness(
                 &[
                     &r_poly,
                     &a_poly,
@@ -884,30 +1106,68 @@ impl Prover {
                 ],
                 &z_challenge,
                 &v_challenge,
-            );
-            self.commit_key.commit(&aggregate_witness)
+            )
         };
 
-        let compute_w_zw = || -> Result<Commitment, Error> {
+        let build_w_zw = || {
             // compute the shifted opening proof polynomial 'W_zw(X)'
-            let shifted_aggregate_witness =
-                CommitKey::compute_aggregate_witness(
-                    &[&z_poly, &a_poly, &b_poly, &d_poly],
-                    &z_w_challenge,
-                    &v_w_challenge,
-                );
-            self.commit_key.commit(&shifted_aggregate_witness)
+            CommitKey::compute_aggregate_witness(
+                &[&z_poly, &a_poly, &b_poly, &d_poly],
+                &z_w_challenge,
+                &v_w_challenge,
+            )
         };
 
         #[cfg(feature = "std")]
-        let (w_z_chall_comm, w_z_chall_w_comm) = {
-            let (w_z, w_zw) = rayon::join(compute_w_z, compute_w_zw);
-            (w_z?, w_zw?)
-        };
+        let (aggregate_witness, shifted_aggregate_witness) =
+            rayon::join(build_w_z, build_w_zw);
 
         #[cfg(not(feature = "std"))]
-        let (w_z_chall_comm, w_z_chall_w_comm) =
-            (compute_w_z()?, compute_w_zw()?);
+        let (aggregate_witness, shifted_aggregate_witness) =
+            (build_w_z(), build_w_zw());
+
+        let [w_z_chall_comm, w_z_chall_w_comm] = self.commit_polynomials([
+            &aggregate_witness,
+            &shifted_aggregate_witness,
+        ])?;
+
+        #[cfg(feature = "std")]
+        if let (
+            Some(t0),
+            Some(tc),
+            Some(twi),
+            Some(twm),
+            Some(tp),
+            Some(tzm),
+            Some(tq),
+            Some(tqm),
+        ) = (
+            t_start,
+            t_composer,
+            t_wire_ifft,
+            t_wire_msm,
+            t_perm,
+            t_z_msm,
+            t_quot,
+            t_quot_msm,
+        ) {
+            let tend = std::time::Instant::now();
+            let ms = |a: std::time::Instant, b: std::time::Instant| {
+                b.duration_since(a).as_secs_f64() * 1e3
+            };
+            std::eprintln!(
+                "[stage n={size:5}] total={:6.2}ms | composer={:5.2} wire_ifft={:5.2} wire_msm={:5.2} perm+z_ifft={:5.2} z_msm={:5.2} quot={:6.2} quot_msm={:5.2} r4+r5={:5.2}",
+                ms(t0, tend),
+                ms(t0, tc),
+                ms(tc, twi),
+                ms(twi, twm),
+                ms(twm, tp),
+                ms(tp, tzm),
+                ms(tzm, tq),
+                ms(tq, tqm),
+                ms(tqm, tend),
+            );
+        }
 
         let proof = Proof {
             a_comm,

@@ -420,6 +420,11 @@ impl CommitKey {
 
         #[cfg(feature = "std")]
         {
+            let raw_terms: Vec<(BlsScalar, &[BlsScalar])> = powers
+                .iter()
+                .zip(polynomials.iter())
+                .map(|(&p, poly)| (p, &poly[..]))
+                .collect();
             const PARALLEL_AGG_MIN_LEN: usize = 1 << 12;
             const AGG_CHUNK_SIZE: usize = 512;
             if max_len >= PARALLEL_AGG_MIN_LEN
@@ -431,36 +436,34 @@ impl CommitKey {
                     .par_chunks_mut(AGG_CHUNK_SIZE)
                     .enumerate()
                     .for_each(|(chunk_idx, out_chunk)| {
-                        let start = chunk_idx * AGG_CHUNK_SIZE;
-                        for (polynomial, power) in
-                            polynomials.iter().zip(&powers)
-                        {
-                            if start < polynomial.len() {
-                                let end = (start + out_chunk.len())
-                                    .min(polynomial.len());
-                                for (coeff, term) in out_chunk[..end - start]
-                                    .iter_mut()
-                                    .zip(&polynomial[start..end])
-                                {
-                                    *coeff += *term * power;
-                                }
-                            }
-                        }
+                        crate::fast_fr::poly_lincomb_chunk_fast(
+                            &raw_terms,
+                            chunk_idx * AGG_CHUNK_SIZE,
+                            out_chunk,
+                        );
                     });
-                return Polynomial::from_coefficients_vec(coefficients)
-                    .ruffini(*point);
+            } else {
+                crate::fast_fr::poly_lincomb_chunk_fast(
+                    &raw_terms,
+                    0,
+                    &mut coefficients,
+                );
             }
+            Polynomial::from_coefficients_vec(coefficients).ruffini(*point)
         }
 
-        for (polynomial, power) in polynomials.iter().zip(&powers) {
-            for (coefficient, term) in
-                coefficients.iter_mut().zip(polynomial.iter())
-            {
-                *coefficient += *term * power;
+        #[cfg(not(feature = "std"))]
+        {
+            for (polynomial, power) in polynomials.iter().zip(&powers) {
+                for (coefficient, term) in
+                    coefficients.iter_mut().zip(polynomial.iter())
+                {
+                    *coefficient += *term * power;
+                }
             }
-        }
 
-        Polynomial::from_coefficients_vec(coefficients).ruffini(*point)
+            Polynomial::from_coefficients_vec(coefficients).ruffini(*point)
+        }
     }
 }
 
@@ -478,6 +481,12 @@ pub struct OpeningKey {
     pub(crate) prepared_h: G2Prepared,
     /// 'x' times the above generator of G2, prepared for use in pairings.
     pub(crate) prepared_x_h: G2Prepared,
+    /// Precomputed `blst` Miller-loop line coefficients for `h`.
+    #[cfg(feature = "blst-backend")]
+    pub(crate) blst_lines_h: alloc::boxed::Box<[blst::blst_fp6; 68]>,
+    /// Precomputed `blst` Miller-loop line coefficients for `x_h`.
+    #[cfg(feature = "blst-backend")]
+    pub(crate) blst_lines_x_h: alloc::boxed::Box<[blst::blst_fp6; 68]>,
 }
 
 #[cfg(feature = "rkyv-impl")]
@@ -533,6 +542,10 @@ fn decode_archived_opening_key(
         x_h,
         prepared_h,
         prepared_x_h,
+        #[cfg(feature = "blst-backend")]
+        blst_lines_h: crate::blst_backend::precompute_g2_lines(&h),
+        #[cfg(feature = "blst-backend")]
+        blst_lines_x_h: crate::blst_backend::precompute_g2_lines(&x_h),
     })
 }
 
@@ -704,6 +717,10 @@ impl OpeningKey {
             x_h,
             prepared_h,
             prepared_x_h,
+            #[cfg(feature = "blst-backend")]
+            blst_lines_h: crate::blst_backend::precompute_g2_lines(&h),
+            #[cfg(feature = "blst-backend")]
+            blst_lines_x_h: crate::blst_backend::precompute_g2_lines(&x_h),
         })
     }
 

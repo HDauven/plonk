@@ -161,12 +161,19 @@ impl Polynomial {
 
     /// Evaluates a [`Polynomial`] at a given value in the field.
     pub(crate) fn evaluate(&self, value: &BlsScalar) -> BlsScalar {
-        let mut result = BlsScalar::zero();
-        for coeff in self.coeffs.iter().rev() {
-            result *= value;
-            result += coeff;
+        #[cfg(feature = "std")]
+        {
+            crate::fast_fr::poly_evaluate_fast(&self.coeffs, value)
         }
-        result
+        #[cfg(not(feature = "std"))]
+        {
+            let mut result = BlsScalar::zero();
+            for coeff in self.coeffs.iter().rev() {
+                result *= value;
+                result += coeff;
+            }
+            result
+        }
     }
 
     /// Given a [`Polynomial`], return it in it's bytes representation
@@ -377,27 +384,30 @@ impl Polynomial {
     ///
     /// Returns the quotient and discards the remainder, which is `self(z)`.
     pub fn ruffini(&self, z: BlsScalar) -> Polynomial {
-        let quotient_len = self.coeffs.len().saturating_sub(1);
-        let mut quotient = Vec::with_capacity(quotient_len);
-        let mut coefficients = self.coeffs.iter().rev().take(quotient_len);
-
-        // Reverse the results and use Ruffini's method to compute the quotient
-        // The coefficients must be reversed as Ruffini's method
-        // starts with the leading coefficient, while Polynomials
-        // are stored in increasing order i.e. the leading coefficient is the
-        // last element
-        if let Some(coefficient) = coefficients.next() {
-            let mut value = *coefficient;
-            quotient.push(value);
-            for coefficient in coefficients {
-                value = coefficient + z * value;
-                quotient.push(value);
-            }
+        #[cfg(feature = "std")]
+        {
+            Polynomial::from_coefficients_vec(
+                crate::fast_fr::poly_ruffini_fast(&self.coeffs, &z),
+            )
         }
+        #[cfg(not(feature = "std"))]
+        {
+            let quotient_len = self.coeffs.len().saturating_sub(1);
+            let mut quotient = Vec::with_capacity(quotient_len);
+            let mut coefficients = self.coeffs.iter().rev().take(quotient_len);
 
-        // Reverse the results for storage in the Polynomial struct
-        quotient.reverse();
-        Polynomial::from_coefficients_vec(quotient)
+            if let Some(coefficient) = coefficients.next() {
+                let mut value = *coefficient;
+                quotient.push(value);
+                for coefficient in coefficients {
+                    value = coefficient + z * value;
+                    quotient.push(value);
+                }
+            }
+
+            quotient.reverse();
+            Polynomial::from_coefficients_vec(quotient)
+        }
     }
 }
 

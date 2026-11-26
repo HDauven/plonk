@@ -5,6 +5,7 @@
 // Copyright (c) DUSK NETWORK. All rights reserved.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(feature = "blst-backend", allow(dead_code))]
 
 //! Variable-time G1 multi-scalar multiplication optimized for PLONK proof
 //! verification.
@@ -62,10 +63,15 @@ const STATIC_ODD_COUNT: usize = 1 << (STATIC_WNAF_WIDTH - 2);
 pub(crate) struct StaticVerifierTables {
     /// Maps each static slot `0..16` to its index in `tables`, or `None` if
     /// the static commitment is the identity point.
+    #[cfg(not(feature = "blst-backend"))]
     slots: [Option<u8>; STATIC_POINT_COUNT],
     /// Compact storage of `[1P, 3P, ..., 31P]` for each non-identity static
     /// point.
+    #[cfg(not(feature = "blst-backend"))]
     tables: Vec<[G1Affine; STATIC_ODD_COUNT]>,
+    /// Precomputed `blst` `wbits` table for the active static points.
+    #[cfg(feature = "blst-backend")]
+    pub(crate) blst: crate::blst_backend::BlstStaticVerifierTable,
 }
 
 #[cfg(not(feature = "std"))]
@@ -75,7 +81,16 @@ pub(crate) struct StaticVerifierTables;
 impl StaticVerifierTables {
     /// Precompute static odd-multiple tables for a `Verifier`'s 16 fixed
     /// commitments.
-    #[cfg(feature = "std")]
+    #[cfg(all(feature = "std", feature = "blst-backend"))]
+    pub(crate) fn new(points: &[G1Affine; STATIC_POINT_COUNT]) -> Self {
+        Self {
+            blst: crate::blst_backend::BlstStaticVerifierTable::new(points),
+        }
+    }
+
+    /// Precompute static odd-multiple tables for a `Verifier`'s 16 fixed
+    /// commitments.
+    #[cfg(all(feature = "std", not(feature = "blst-backend")))]
     pub(crate) fn new(points: &[G1Affine; STATIC_POINT_COUNT]) -> Self {
         let mut slots = [None; STATIC_POINT_COUNT];
         let mut active_points = Vec::with_capacity(STATIC_POINT_COUNT);
@@ -294,6 +309,51 @@ fn straus_eval_slice(
 /// - `left = -(w_z + u_challenge * w_zw)`
 /// - `right = sum(static_points[i] * static_scalars[i])` plus
 ///   `sum(dynamic_points[j] * dynamic_scalars[j])`
+#[cfg(feature = "blst-backend")]
+pub(crate) fn verifier_msm_single(
+    _static_points: &[G1Affine; STATIC_POINT_COUNT],
+    static_tables: &StaticVerifierTables,
+    static_scalars: &[BlsScalar; STATIC_POINT_COUNT],
+    dynamic_points: &[G1Affine; DYNAMIC_POINT_COUNT],
+    dynamic_scalars: &[BlsScalar; DYNAMIC_POINT_COUNT],
+    w_z: &G1Affine,
+    w_zw: &G1Affine,
+    u_challenge: &BlsScalar,
+) -> (G1Projective, G1Projective) {
+    let (left, right) = crate::blst_backend::verifier_msm_single_blst(
+        &static_tables.blst,
+        static_scalars,
+        dynamic_points,
+        dynamic_scalars,
+        w_z,
+        w_zw,
+        u_challenge,
+    );
+    (G1Projective::from(left), G1Projective::from(right))
+}
+
+#[cfg(feature = "blst-backend")]
+pub(crate) fn verifier_msm_single_affine(
+    static_tables: &StaticVerifierTables,
+    static_scalars: &[BlsScalar; STATIC_POINT_COUNT],
+    dynamic_points: &[G1Affine; DYNAMIC_POINT_COUNT],
+    dynamic_scalars: &[BlsScalar; DYNAMIC_POINT_COUNT],
+    w_z: &G1Affine,
+    w_zw: &G1Affine,
+    u_challenge: &BlsScalar,
+) -> (G1Affine, G1Affine) {
+    crate::blst_backend::verifier_msm_single_blst(
+        &static_tables.blst,
+        static_scalars,
+        dynamic_points,
+        dynamic_scalars,
+        w_z,
+        w_zw,
+        u_challenge,
+    )
+}
+
+#[cfg(not(feature = "blst-backend"))]
 pub(crate) fn verifier_msm_single(
     static_points: &[G1Affine; STATIC_POINT_COUNT],
     static_tables: &StaticVerifierTables,
@@ -696,11 +756,37 @@ fn straus_variable_base(pts: &[G1Affine], scs: &[BlsScalar]) -> G1Projective {
     eval_chunk(pts, scs)
 }
 
+/// Variable-time variable-base G1 MSM for public verifier scalars returning an
+/// affine point directly under `blst-backend`.
+#[cfg(feature = "blst-backend")]
+pub(crate) fn msm_public_variable_base_affine(
+    points: &[G1Affine],
+    scalars: &[BlsScalar],
+) -> G1Affine {
+    crate::blst_backend::msm_g1_variable_base(points, scalars)
+}
+
 /// Variable-time variable-base G1 MSM for public verifier scalars.
 ///
 /// Filters identity bases and zero scalars, folds `±1` directly without table
 /// setup, uses Straus wNAF for small inputs (`<= 48` active terms), and uses
 /// signed-digit Pippenger for larger batches.
+#[cfg(feature = "blst-backend")]
+pub(crate) fn msm_public_variable_base(
+    points: &[G1Affine],
+    scalars: &[BlsScalar],
+) -> G1Projective {
+    G1Projective::from(crate::blst_backend::msm_g1_variable_base(
+        points, scalars,
+    ))
+}
+
+/// Variable-time variable-base G1 MSM for public verifier scalars.
+///
+/// Filters identity bases and zero scalars, folds `±1` directly without table
+/// setup, uses Straus wNAF for small inputs (`<= 48` active terms), and uses
+/// signed-digit Pippenger for larger batches.
+#[cfg(not(feature = "blst-backend"))]
 pub(crate) fn msm_public_variable_base(
     points: &[G1Affine],
     scalars: &[BlsScalar],

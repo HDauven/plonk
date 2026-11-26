@@ -15,9 +15,10 @@ use crate::commitment_scheme::OpeningKey;
 use crate::error::Error;
 use crate::fft::EvaluationDomain;
 use crate::proof_system::proof::alloc::PreparedVerification;
+#[cfg(not(feature = "blst-backend"))]
+use crate::proof_system::verifier_msm::msm_public_variable_base;
 use crate::proof_system::verifier_msm::{
     DYNAMIC_POINT_COUNT, STATIC_POINT_COUNT, StaticVerifierTables,
-    msm_public_variable_base,
 };
 use crate::proof_system::{Proof, VerifierKey};
 use crate::transcript::TranscriptProtocol;
@@ -381,52 +382,103 @@ impl Verifier {
         let prepared = self.prepare_batch_items(items, version)?;
 
         let mut merged_static = [BlsScalar::zero(); STATIC_POINT_COUNT];
-        let mut left_pts = Vec::with_capacity(2 * items.len());
-        let mut left_scs = Vec::with_capacity(2 * items.len());
-        let mut right_pts = Vec::with_capacity(
-            STATIC_POINT_COUNT + DYNAMIC_POINT_COUNT * items.len(),
-        );
-        let mut right_scs = Vec::with_capacity(
-            STATIC_POINT_COUNT + DYNAMIC_POINT_COUNT * items.len(),
-        );
+        #[cfg(feature = "blst-backend")]
+        {
+            let mut left_pts = Vec::with_capacity(2 * items.len());
+            let mut left_scs = Vec::with_capacity(2 * items.len());
+            let mut right_dyn_pts =
+                Vec::with_capacity(DYNAMIC_POINT_COUNT * items.len());
+            let mut right_dyn_scs =
+                Vec::with_capacity(DYNAMIC_POINT_COUNT * items.len());
 
-        right_pts.extend_from_slice(&self.static_points);
-        right_scs.resize(STATIC_POINT_COUNT, BlsScalar::zero());
-
-        for (prep, &rho) in prepared.iter().zip(rhos.iter()) {
-            if rho == BlsScalar::one() {
-                for (dst, src) in
-                    merged_static.iter_mut().zip(prep.static_scalars.iter())
-                {
-                    *dst += *src;
-                }
-                left_pts.push(prep.w_z);
-                left_scs.push(BlsScalar::one());
-                left_pts.push(prep.w_zw);
-                left_scs.push(prep.u_challenge);
-                right_pts.extend_from_slice(&prep.dynamic_points);
-                right_scs.extend_from_slice(&prep.dynamic_scalars);
-            } else {
-                for (dst, src) in
-                    merged_static.iter_mut().zip(prep.static_scalars.iter())
-                {
-                    *dst += rho * *src;
-                }
-                left_pts.push(prep.w_z);
-                left_scs.push(rho);
-                left_pts.push(prep.w_zw);
-                left_scs.push(rho * prep.u_challenge);
-                right_pts.extend_from_slice(&prep.dynamic_points);
-                for sc in &prep.dynamic_scalars {
-                    right_scs.push(rho * *sc);
+            for (prep, &rho) in prepared.iter().zip(rhos.iter()) {
+                if rho == BlsScalar::one() {
+                    for (dst, src) in
+                        merged_static.iter_mut().zip(prep.static_scalars.iter())
+                    {
+                        *dst += *src;
+                    }
+                    left_pts.push(prep.w_z);
+                    left_scs.push(BlsScalar::one());
+                    left_pts.push(prep.w_zw);
+                    left_scs.push(prep.u_challenge);
+                    right_dyn_pts.extend_from_slice(&prep.dynamic_points);
+                    right_dyn_scs.extend_from_slice(&prep.dynamic_scalars);
+                } else {
+                    for (dst, src) in
+                        merged_static.iter_mut().zip(prep.static_scalars.iter())
+                    {
+                        *dst += rho * *src;
+                    }
+                    left_pts.push(prep.w_z);
+                    left_scs.push(rho);
+                    left_pts.push(prep.w_zw);
+                    left_scs.push(rho * prep.u_challenge);
+                    right_dyn_pts.extend_from_slice(&prep.dynamic_points);
+                    for sc in &prep.dynamic_scalars {
+                        right_dyn_scs.push(rho * *sc);
+                    }
                 }
             }
-        }
-        right_scs[..STATIC_POINT_COUNT].copy_from_slice(&merged_static);
 
-        let left = -msm_public_variable_base(&left_pts, &left_scs);
-        let right = msm_public_variable_base(&right_pts, &right_scs);
-        Proof::verify_pairing(&self.opening_key, left, right)
+            let (left, right) = crate::blst_backend::verify_batch_msm_blst(
+                &left_pts,
+                &left_scs,
+                &right_dyn_pts,
+                &right_dyn_scs,
+                Some((&self.static_tables.blst, &merged_static)),
+            );
+            Proof::verify_pairing_affine(&self.opening_key, left, right)
+        }
+        #[cfg(not(feature = "blst-backend"))]
+        {
+            let mut left_pts = Vec::with_capacity(2 * items.len());
+            let mut left_scs = Vec::with_capacity(2 * items.len());
+            let mut right_pts = Vec::with_capacity(
+                STATIC_POINT_COUNT + DYNAMIC_POINT_COUNT * items.len(),
+            );
+            let mut right_scs = Vec::with_capacity(
+                STATIC_POINT_COUNT + DYNAMIC_POINT_COUNT * items.len(),
+            );
+
+            right_pts.extend_from_slice(&self.static_points);
+            right_scs.resize(STATIC_POINT_COUNT, BlsScalar::zero());
+
+            for (prep, &rho) in prepared.iter().zip(rhos.iter()) {
+                if rho == BlsScalar::one() {
+                    for (dst, src) in
+                        merged_static.iter_mut().zip(prep.static_scalars.iter())
+                    {
+                        *dst += *src;
+                    }
+                    left_pts.push(prep.w_z);
+                    left_scs.push(BlsScalar::one());
+                    left_pts.push(prep.w_zw);
+                    left_scs.push(prep.u_challenge);
+                    right_pts.extend_from_slice(&prep.dynamic_points);
+                    right_scs.extend_from_slice(&prep.dynamic_scalars);
+                } else {
+                    for (dst, src) in
+                        merged_static.iter_mut().zip(prep.static_scalars.iter())
+                    {
+                        *dst += rho * *src;
+                    }
+                    left_pts.push(prep.w_z);
+                    left_scs.push(rho);
+                    left_pts.push(prep.w_zw);
+                    left_scs.push(rho * prep.u_challenge);
+                    right_pts.extend_from_slice(&prep.dynamic_points);
+                    for sc in &prep.dynamic_scalars {
+                        right_scs.push(rho * *sc);
+                    }
+                }
+            }
+            right_scs[..STATIC_POINT_COUNT].copy_from_slice(&merged_static);
+
+            let left = -msm_public_variable_base(&left_pts, &left_scs);
+            let right = msm_public_variable_base(&right_pts, &right_scs);
+            Proof::verify_pairing(&self.opening_key, left, right)
+        }
     }
 
     fn prepare_one(
@@ -458,12 +510,12 @@ impl Verifier {
         P: AsRef<[BlsScalar]> + Sync,
     {
         #[cfg(feature = "std")]
-        if items.len() >= 16 && rayon::current_num_threads() > 1 {
+        if items.len() >= 4 && rayon::current_num_threads() > 1 {
             use rayon::prelude::*;
 
             return items
                 .par_iter()
-                .with_min_len(8)
+                .with_min_len(2)
                 .map(|(proof, pi)| {
                     self.prepare_one(proof, pi.as_ref(), version)
                 })
@@ -679,12 +731,12 @@ impl<'a> BatchVerifier<'a> {
 
         #[cfg(feature = "std")]
         let prepared: Vec<PreparedVerification> =
-            if self.entries.len() >= 16 && rayon::current_num_threads() > 1 {
+            if self.entries.len() >= 4 && rayon::current_num_threads() > 1 {
                 use rayon::prelude::*;
 
                 self.entries
                     .par_iter()
-                    .with_min_len(8)
+                    .with_min_len(2)
                     .map(prepare_entry)
                     .collect::<Result<Vec<_>, _>>()?
             } else {
@@ -775,9 +827,19 @@ impl<'a> BatchVerifier<'a> {
         right_pts.push(opening_key.g);
         right_scs.push(g_scalar);
 
-        let left = -msm_public_variable_base(&left_pts, &left_scs);
-        let right = msm_public_variable_base(&right_pts, &right_scs);
-        Proof::verify_pairing(opening_key, left, right)
+        #[cfg(feature = "blst-backend")]
+        {
+            let (left, right) = crate::blst_backend::verify_batch_msm_blst(
+                &left_pts, &left_scs, &right_pts, &right_scs, None,
+            );
+            Proof::verify_pairing_affine(opening_key, left, right)
+        }
+        #[cfg(not(feature = "blst-backend"))]
+        {
+            let left = -msm_public_variable_base(&left_pts, &left_scs);
+            let right = msm_public_variable_base(&right_pts, &right_scs);
+            Proof::verify_pairing(opening_key, left, right)
+        }
     }
 }
 

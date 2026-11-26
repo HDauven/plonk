@@ -12,6 +12,8 @@
 //! This allows us to perform polynomial operations in O(n)
 //! by performing an O(n log n) FFT over such a domain.
 
+#![cfg_attr(feature = "std", allow(dead_code))]
+
 #[cfg(feature = "rkyv-impl")]
 use bytecheck::CheckBytes;
 use dusk_bls12_381::BlsScalar;

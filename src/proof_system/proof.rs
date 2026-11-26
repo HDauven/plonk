@@ -137,15 +137,36 @@ impl Serializable<{ 11 * Commitment::SIZE + ProofEvaluations::SIZE }>
                 comm_bytes.as_chunks::<{ Commitment::SIZE }>();
             let mut comms = [Ok(Commitment::default()); 11];
             if rayon::current_num_threads() > 1 {
-                comms
-                    .par_chunks_mut(3)
-                    .zip(comm_chunks.par_chunks(3))
-                    .for_each(|(slots, chunks)| {
+                // 4-way flat join (3+3+3+2 points) avoids waking 11 threads on
+                // hybrid cores while keeping critical-path decode at 3 points.
+                let (c05, c610) = comm_chunks.split_at(6);
+                let (c02, c35) = c05.split_at(3);
+                let (c68, c910) = c610.split_at(3);
+                let (s05, s610) = comms.split_at_mut(6);
+                let (s02, s35) = s05.split_at_mut(3);
+                let (s68, s910) = s610.split_at_mut(3);
+                let decode_slice =
+                    |slots: &mut [Result<Commitment, dusk_bytes::Error>],
+                     chunks: &[[u8; Commitment::SIZE]]| {
                         for (slot, chunk) in slots.iter_mut().zip(chunks.iter())
                         {
                             *slot = Commitment::from_bytes(chunk);
                         }
-                    });
+                    };
+                rayon::join(
+                    || {
+                        rayon::join(
+                            || decode_slice(s02, c02),
+                            || decode_slice(s35, c35),
+                        )
+                    },
+                    || {
+                        rayon::join(
+                            || decode_slice(s68, c68),
+                            || decode_slice(s910, c910),
+                        )
+                    },
+                );
             } else {
                 for (slot, chunk) in comms.iter_mut().zip(comm_chunks.iter()) {
                     *slot = Commitment::from_bytes(chunk);
@@ -379,8 +400,27 @@ pub(crate) mod alloc {
             Ok(prepared)
         }
 
+        /// Execute the final 2-pair BLS12-381 pairing check on affine inputs.
+        #[cfg(feature = "blst-backend")]
+        pub(crate) fn verify_pairing_affine(
+            opening_key: &OpeningKey,
+            left_affine: G1Affine,
+            right_affine: G1Affine,
+        ) -> Result<(), Error> {
+            if !crate::blst_backend::verify_pairing_lines(
+                &left_affine,
+                &right_affine,
+                &opening_key.blst_lines_x_h,
+                &opening_key.blst_lines_h,
+            ) {
+                return Err(Error::ProofVerificationError);
+            }
+            Ok(())
+        }
+
         /// Execute the final 2-pair BLS12-381 pairing check shared by single
         /// and batched verification.
+        #[cfg(not(all(feature = "blst-backend", not(test))))]
         pub(crate) fn verify_pairing(
             opening_key: &OpeningKey,
             left_projective: G1Projective,
@@ -390,17 +430,24 @@ pub(crate) mod alloc {
             let mut affines = [G1Affine::identity(); 2];
             G1Projective::batch_normalize(&projectives, &mut affines);
 
-            let pairing = dusk_bls12_381::multi_miller_loop(&[
-                (&affines[0], &opening_key.prepared_x_h),
-                (&affines[1], &opening_key.prepared_h),
-            ])
-            .final_exponentiation();
-
-            if pairing != dusk_bls12_381::Gt::identity() {
-                return Err(Error::ProofVerificationError);
+            #[cfg(feature = "blst-backend")]
+            {
+                Self::verify_pairing_affine(opening_key, affines[0], affines[1])
             }
+            #[cfg(not(feature = "blst-backend"))]
+            {
+                let pairing = dusk_bls12_381::multi_miller_loop(&[
+                    (&affines[0], &opening_key.prepared_x_h),
+                    (&affines[1], &opening_key.prepared_h),
+                ])
+                .final_exponentiation();
 
-            Ok(())
+                if pairing != dusk_bls12_381::Gt::identity() {
+                    return Err(Error::ProofVerificationError);
+                }
+
+                Ok(())
+            }
         }
 
         #[allow(non_snake_case)]
@@ -749,68 +796,95 @@ pub(crate) mod alloc {
                 bind_selectors,
             )?;
 
-            let (left_projective, right_projective) = verifier_msm_single(
-                static_points,
-                static_tables,
-                &prepared.static_scalars,
-                &prepared.dynamic_points,
-                &prepared.dynamic_scalars,
-                &prepared.w_z,
-                &prepared.w_zw,
-                &prepared.u_challenge,
-            );
-
-            #[cfg(test)]
+            #[cfg(all(feature = "blst-backend", not(test)))]
             {
-                let ref_data = _ref_data;
-                let f_points_full = [
-                    self.a_comm.0,
-                    self.b_comm.0,
-                    self.c_comm.0,
-                    self.d_comm.0,
-                    verifier_key.permutation.s_sigma_1.0,
-                    verifier_key.permutation.s_sigma_2.0,
-                    verifier_key.permutation.s_sigma_3.0,
-                    verifier_key.arithmetic.q_arith.0,
-                    verifier_key.arithmetic.q_c.0,
-                    verifier_key.arithmetic.q_l.0,
-                    verifier_key.arithmetic.q_r.0,
-                ];
-                let f_points = if bind_selectors {
-                    &f_points_full[..]
-                } else {
-                    &f_points_full[..V_MAX_DEGREE_LEGACY]
-                };
-                assert_grouped_msm_equivalence(
-                    &right_projective,
-                    self.compute_reference_linearization_commitment(
-                        &ref_data.alpha,
-                        &ref_data.beta,
-                        &ref_data.gamma,
-                        (
-                            &ref_data.range_sep_challenge,
-                            &ref_data.logic_sep_challenge,
-                            &ref_data.fixed_base_sep_challenge,
-                            &ref_data.var_base_sep_challenge,
-                        ),
-                        &ref_data.z_challenge,
-                        &ref_data.u_challenge,
-                        ref_data.l1_eval,
-                        verifier_key,
-                        domain,
-                    ),
-                    f_points,
-                    &ref_data.f_scalars,
-                    opening_key.g,
-                    ref_data.e_scalar,
-                    self.w_z_chall_comm.0,
-                    ref_data.z_challenge,
-                    self.w_z_chall_w_comm.0,
-                    ref_data.shifted_witness_scalar,
-                );
+                let _ = (verifier_key, static_points);
+                let (left_affine, right_affine) =
+                    crate::proof_system::verifier_msm::verifier_msm_single_affine(
+                        static_tables,
+                        &prepared.static_scalars,
+                        &prepared.dynamic_points,
+                        &prepared.dynamic_scalars,
+                        &prepared.w_z,
+                        &prepared.w_zw,
+                        &prepared.u_challenge,
+                    );
+                Self::verify_pairing_affine(
+                    opening_key,
+                    left_affine,
+                    right_affine,
+                )
             }
 
-            Self::verify_pairing(opening_key, left_projective, right_projective)
+            #[cfg(not(all(feature = "blst-backend", not(test))))]
+            {
+                let (left_projective, right_projective) = verifier_msm_single(
+                    static_points,
+                    static_tables,
+                    &prepared.static_scalars,
+                    &prepared.dynamic_points,
+                    &prepared.dynamic_scalars,
+                    &prepared.w_z,
+                    &prepared.w_zw,
+                    &prepared.u_challenge,
+                );
+
+                #[cfg(test)]
+                {
+                    let ref_data = _ref_data;
+                    let f_points_full = [
+                        self.a_comm.0,
+                        self.b_comm.0,
+                        self.c_comm.0,
+                        self.d_comm.0,
+                        verifier_key.permutation.s_sigma_1.0,
+                        verifier_key.permutation.s_sigma_2.0,
+                        verifier_key.permutation.s_sigma_3.0,
+                        verifier_key.arithmetic.q_arith.0,
+                        verifier_key.arithmetic.q_c.0,
+                        verifier_key.arithmetic.q_l.0,
+                        verifier_key.arithmetic.q_r.0,
+                    ];
+                    let f_points = if bind_selectors {
+                        &f_points_full[..]
+                    } else {
+                        &f_points_full[..V_MAX_DEGREE_LEGACY]
+                    };
+                    assert_grouped_msm_equivalence(
+                        &right_projective,
+                        self.compute_reference_linearization_commitment(
+                            &ref_data.alpha,
+                            &ref_data.beta,
+                            &ref_data.gamma,
+                            (
+                                &ref_data.range_sep_challenge,
+                                &ref_data.logic_sep_challenge,
+                                &ref_data.fixed_base_sep_challenge,
+                                &ref_data.var_base_sep_challenge,
+                            ),
+                            &ref_data.z_challenge,
+                            &ref_data.u_challenge,
+                            ref_data.l1_eval,
+                            verifier_key,
+                            domain,
+                        ),
+                        f_points,
+                        &ref_data.f_scalars,
+                        opening_key.g,
+                        ref_data.e_scalar,
+                        self.w_z_chall_comm.0,
+                        ref_data.z_challenge,
+                        self.w_z_chall_w_comm.0,
+                        ref_data.shifted_witness_scalar,
+                    );
+                }
+
+                Self::verify_pairing(
+                    opening_key,
+                    left_projective,
+                    right_projective,
+                )
+            }
         }
 
         /// Reconstruct the pre-regrouping linearization commitment directly

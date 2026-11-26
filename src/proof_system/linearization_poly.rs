@@ -323,22 +323,10 @@ pub(crate) fn compute(
 
     let mut coeffs = vec![BlsScalar::zero(); max_len];
 
-    let accumulate_range = |start: usize, out_chunk: &mut [BlsScalar]| {
-        for (scalar, poly) in &terms {
-            if *scalar == BlsScalar::zero() || start >= poly.len() {
-                continue;
-            }
-            let end = (start + out_chunk.len()).min(poly.len());
-            for (dst, src) in
-                out_chunk[..end - start].iter_mut().zip(&poly[start..end])
-            {
-                *dst += *src * scalar;
-            }
-        }
-    };
-
     #[cfg(feature = "std")]
     {
+        let raw_terms: [(BlsScalar, &[BlsScalar]); 16] =
+            terms.map(|(s, p)| (s, &p[..]));
         const PARALLEL_LIN_MIN_LEN: usize = 1 << 12;
         const LIN_CHUNK_SIZE: usize = 512;
         if max_len >= PARALLEL_LIN_MIN_LEN && rayon::current_num_threads() > 1 {
@@ -346,16 +334,29 @@ pub(crate) fn compute(
 
             coeffs.par_chunks_mut(LIN_CHUNK_SIZE).enumerate().for_each(
                 |(chunk_idx, out_chunk)| {
-                    accumulate_range(chunk_idx * LIN_CHUNK_SIZE, out_chunk);
+                    crate::fast_fr::poly_lincomb_chunk_fast(
+                        &raw_terms,
+                        chunk_idx * LIN_CHUNK_SIZE,
+                        out_chunk,
+                    );
                 },
             );
         } else {
-            accumulate_range(0, &mut coeffs);
+            crate::fast_fr::poly_lincomb_chunk_fast(&raw_terms, 0, &mut coeffs);
         }
     }
 
     #[cfg(not(feature = "std"))]
-    accumulate_range(0, &mut coeffs);
+    {
+        for (scalar, poly) in &terms {
+            if *scalar == BlsScalar::zero() {
+                continue;
+            }
+            for (dst, src) in coeffs.iter_mut().zip(poly.iter()) {
+                *dst += *src * scalar;
+            }
+        }
+    }
 
     coeffs[0] += pi_eval;
     Polynomial::from_coefficients_vec(coeffs)

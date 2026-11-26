@@ -119,9 +119,14 @@ impl Composer {
     ) -> Result<TorsionFreeWitnessPoint, Error> {
         let generator = generator.into();
 
-        if generator.get_z() == BlsScalar::zero()
-            || !bool::from(generator.is_on_curve())
-            || !bool::from(generator.is_prime_order())
+        let is_std_gen = generator.get_z() != BlsScalar::zero()
+            && bool::from(generator.is_on_curve())
+            && generator == dusk_jubjub::GENERATOR_EXTENDED;
+
+        if !is_std_gen
+            && (generator.get_z() == BlsScalar::zero()
+                || !bool::from(generator.is_on_curve())
+                || !bool::from(generator.is_prime_order()))
         {
             return Err(Error::JubJubGeneratorNotPrimeOrder);
         }
@@ -160,24 +165,52 @@ impl Composer {
 
         // Compute [2^i]generator and reverse the table to match the
         // most-significant-first Horner recurrence of the scalar accumulator.
-        let mut wnaf_point_multiples: Vec<_> = {
-            let mut multiples =
-                vec![JubJubExtended::default(); FIXED_BASE_SIGNED_DIGIT_ROUNDS];
+        // Cache the standard generator table under `std` to avoid 255 doublings
+        // and a 256-point batch inversion on every call.
+        let owned_multiples: Vec<JubJubAffine>;
+        let wnaf_point_multiples: &[JubJubAffine] = {
+            #[cfg(feature = "std")]
+            let cached = if generator.get_z() != BlsScalar::zero()
+                && bool::from(generator.is_on_curve())
+                && generator == dusk_jubjub::GENERATOR_EXTENDED
+            {
+                Some(standard_generator_multiples())
+            } else {
+                None
+            };
+            #[cfg(not(feature = "std"))]
+            let cached: Option<
+                &[JubJubAffine; FIXED_BASE_SIGNED_DIGIT_ROUNDS],
+            > = None;
 
-            multiples[0] = generator;
-
-            for i in 1..FIXED_BASE_SIGNED_DIGIT_ROUNDS {
-                multiples[i] = multiples[i - 1].double();
+            if let Some(table) = cached {
+                table.as_slice()
+            } else {
+                let mut multiples = vec![
+                    JubJubExtended::default();
+                    FIXED_BASE_SIGNED_DIGIT_ROUNDS
+                ];
+                multiples[0] = generator;
+                for i in 1..FIXED_BASE_SIGNED_DIGIT_ROUNDS {
+                    multiples[i] = multiples[i - 1].double();
+                }
+                let mut rev: Vec<JubJubAffine> =
+                    dusk_jubjub::batch_normalize(&mut multiples).collect();
+                rev.reverse();
+                owned_multiples = rev;
+                owned_multiples.as_slice()
             }
-
-            dusk_jubjub::batch_normalize(&mut multiples).collect()
         };
 
-        wnaf_point_multiples.reverse();
-
-        // initialize the accumulators
-        let mut scalar_acc = vec![BlsScalar::zero()];
-        let mut point_acc = vec![JubJubAffine::identity()];
+        // Initialize the accumulators. Accumulate points in extended
+        // coordinates and batch-normalize all 257 points in one inversion
+        // instead of 256 serial field inversions.
+        let mut scalar_acc =
+            Vec::with_capacity(FIXED_BASE_SIGNED_DIGIT_ROUNDS + 1);
+        scalar_acc.push(BlsScalar::zero());
+        let mut point_acc_ext =
+            Vec::with_capacity(FIXED_BASE_SIGNED_DIGIT_ROUNDS + 1);
+        point_acc_ext.push(JubJubExtended::identity());
 
         // Auxiliary point to help with checks on the backend.
         let two = BlsScalar::from(2u64);
@@ -214,10 +247,8 @@ impl Composer {
                 let scalar = prev_accumulator + scalar_to_add;
                 scalar_acc.push(scalar);
 
-                let a = JubJubExtended::from(point_acc[i]);
-                let b = JubJubExtended::from(point_to_add);
-                let point = a + b;
-                point_acc.push(point.into());
+                let point = point_acc_ext[i] + point_to_add;
+                point_acc_ext.push(point);
 
                 let x_alpha = point_to_add.get_u();
                 let y_alpha = point_to_add.get_v();
@@ -225,6 +256,13 @@ impl Composer {
                 Ok(x_alpha * y_alpha)
             })
             .collect::<Result<_, Error>>()?;
+
+        let point_acc: Vec<JubJubAffine> =
+            if point_acc_ext.iter().all(|p| p.get_z() != BlsScalar::zero()) {
+                dusk_jubjub::batch_normalize(&mut point_acc_ext).collect()
+            } else {
+                point_acc_ext.into_iter().map(JubJubAffine::from).collect()
+            };
 
         let mut leading_accumulator = Self::ZERO;
 
@@ -336,6 +374,32 @@ impl Composer {
         );
         self.range_check(distance_from_max, JUBJUB_SCALAR_BITS);
     }
+}
+
+#[cfg(feature = "std")]
+fn standard_generator_multiples()
+-> &'static [JubJubAffine; FIXED_BASE_SIGNED_DIGIT_ROUNDS] {
+    static TABLE: std::sync::OnceLock<
+        [JubJubAffine; FIXED_BASE_SIGNED_DIGIT_ROUNDS],
+    > = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut multiples =
+            [JubJubExtended::default(); FIXED_BASE_SIGNED_DIGIT_ROUNDS];
+        multiples[0] = dusk_jubjub::GENERATOR_EXTENDED;
+        for i in 1..FIXED_BASE_SIGNED_DIGIT_ROUNDS {
+            multiples[i] = multiples[i - 1].double();
+        }
+        let mut affine =
+            [JubJubAffine::identity(); FIXED_BASE_SIGNED_DIGIT_ROUNDS];
+        for (dst, src) in affine
+            .iter_mut()
+            .rev()
+            .zip(dusk_jubjub::batch_normalize(&mut multiples))
+        {
+            *dst = src;
+        }
+        affine
+    })
 }
 
 /// Width-2 NAF of `scalar`, as `compute_windowed_naf(2)` but without

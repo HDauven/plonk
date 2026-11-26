@@ -4,6 +4,8 @@
 //
 // Copyright (c) DUSK NETWORK. All rights reserved.
 
+#![cfg_attr(feature = "std", allow(dead_code))]
+
 use alloc::vec::Vec;
 
 use dusk_bls12_381::BlsScalar;
