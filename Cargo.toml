@@ -80,6 +80,10 @@ codegen-units = 1
 name = "circuit"
 required-features = ["alloc"]
 
+[[example]]
+name = "profile_plonk"
+required-features = ["std"]
+
 [[bench]]
 name = "plonk"
 harness = false
