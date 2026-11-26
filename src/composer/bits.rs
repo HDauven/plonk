@@ -88,6 +88,7 @@ impl Composer {
         let mut low = Self::ZERO;
 
         let acc = Self::ZERO;
+        let mut pow2 = BlsScalar::one();
         let acc = bit_values
             .iter()
             .enumerate()
@@ -97,11 +98,9 @@ impl Composer {
 
                 self.component_boolean(*w_bit);
 
-                let constraint = Constraint::new()
-                    .left(BlsScalar::pow_of_2(i as u64))
-                    .right(1)
-                    .a(*w_bit)
-                    .b(acc);
+                let constraint =
+                    Constraint::new().left(pow2).right(1).a(*w_bit).b(acc);
+                pow2 += pow2;
 
                 let acc = self.gate_add(constraint);
                 if i == 253 {

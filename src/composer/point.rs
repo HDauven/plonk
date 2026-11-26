@@ -10,6 +10,7 @@
 
 use dusk_bls12_381::BlsScalar;
 use dusk_jubjub::{EDWARDS_D, JubJubAffine, JubJubExtended, JubJubScalar};
+use subtle::{Choice, ConditionallySelectable};
 
 use super::{
     Composer, Constraint, TorsionFreeWitnessPoint, Witness, WitnessPoint,
@@ -266,7 +267,8 @@ impl Composer {
         point: WitnessPoint,
         q: JubJubAffine,
     ) {
-        let q = self.append_affine_point(q);
+        let q_aff = q;
+        let q = self.append_affine_point(q_aff);
         let qu = *q.x();
         let qv = *q.y();
 
@@ -286,10 +288,27 @@ impl Composer {
         );
 
         // Constrain point == [8]·Q
-        let q2 = self.add_point_gates(q, q);
-        let q4 = self.add_point_gates(q2, q2);
-        let q8 = self.add_point_gates(q4, q4);
-        self.assert_equal_point(point, q8);
+        if bool::from(q_aff.is_on_curve()) {
+            let mut ext = [JubJubExtended::identity(); 3];
+            ext[0] = JubJubExtended::from(q_aff).double();
+            ext[1] = ext[0].double();
+            ext[2] = ext[1].double();
+            let mut aff = [JubJubAffine::identity(); 3];
+            for (dst, src) in
+                aff.iter_mut().zip(dusk_jubjub::batch_normalize(&mut ext))
+            {
+                *dst = src;
+            }
+            let q2 = self.add_point_gates_with_sum(q, q, aff[0]);
+            let q4 = self.add_point_gates_with_sum(q2, q2, aff[1]);
+            let q8 = self.add_point_gates_with_sum(q4, q4, aff[2]);
+            self.assert_equal_point(point, q8);
+        } else {
+            let q2 = self.add_point_gates(q, q);
+            let q4 = self.add_point_gates(q2, q2);
+            let q8 = self.add_point_gates(q4, q4);
+            self.assert_equal_point(point, q8);
+        }
     }
 
     /// Negates a curve point by consuming 1 gate.
@@ -379,6 +398,20 @@ impl Composer {
             sum.into()
         };
 
+        self.add_point_gates_with_sum(a, b, point)
+    }
+
+    fn add_point_gates_with_sum(
+        &mut self,
+        a: WitnessPoint,
+        b: WitnessPoint,
+        point: JubJubAffine,
+    ) -> WitnessPoint {
+        let x_1 = *a.x();
+        let y_1 = *a.y();
+        let x_2 = *b.x();
+        let y_2 = *b.y();
+
         let x_3 = point.get_u();
         let y_3 = point.get_v();
 
@@ -457,6 +490,72 @@ impl Composer {
         let scalar_bits = self.component_decomposition::<252>(jubjub);
 
         let mut result = WitnessPoint::from(Self::IDENTITY);
+
+        let p_aff = JubJubAffine::from_raw_unchecked(
+            self[*point.x()],
+            self[*point.y()],
+        );
+        let all_bits_boolean = scalar_bits.iter().all(|&b| {
+            self[b] == BlsScalar::zero() || self[b] == BlsScalar::one()
+        });
+
+        if bool::from(p_aff.is_on_curve()) && all_bits_boolean {
+            // Compute all 504 intermediate curve points in extended coordinates
+            // and normalize them in a single batched inversion instead of 504
+            // serial field inversions.
+            let mut ext_points = [JubJubExtended::identity(); 504];
+            let mut cur = JubJubExtended::identity();
+            let mut all_nonzero_z = true;
+
+            for (idx, &bit) in scalar_bits.iter().rev().enumerate() {
+                let doubled = cur.double();
+                ext_points[2 * idx] = doubled;
+                let is_one =
+                    Choice::from(u8::from(self[bit] == BlsScalar::one()));
+                let addend = JubJubAffine::conditional_select(
+                    &JubJubAffine::identity(),
+                    &p_aff,
+                    is_one,
+                );
+                cur = doubled + addend;
+                ext_points[2 * idx + 1] = cur;
+                if doubled.get_z() == BlsScalar::zero()
+                    || cur.get_z() == BlsScalar::zero()
+                {
+                    all_nonzero_z = false;
+                }
+            }
+
+            if all_nonzero_z {
+                let mut aff_points = [JubJubAffine::identity(); 504];
+                for (dst, src) in aff_points
+                    .iter_mut()
+                    .zip(dusk_jubjub::batch_normalize(&mut ext_points))
+                {
+                    *dst = src;
+                }
+
+                for (idx, bit) in scalar_bits.iter().rev().enumerate() {
+                    result = self.add_point_gates_with_sum(
+                        result,
+                        result,
+                        aff_points[2 * idx],
+                    );
+
+                    // The bits are already boolean-constrained by the
+                    // decomposition, so the unconstrained seam is sound here
+                    // and saves a gate per round.
+                    let point_to_add = self.select_identity_gates(*bit, point);
+                    result = self.add_point_gates_with_sum(
+                        result,
+                        point_to_add,
+                        aff_points[2 * idx + 1],
+                    );
+                }
+
+                return TorsionFreeWitnessPoint::new_unchecked(result);
+            }
+        }
 
         for bit in scalar_bits.iter().rev() {
             result = self.add_point_gates(result, result);

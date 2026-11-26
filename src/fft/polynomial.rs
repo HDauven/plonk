@@ -27,7 +27,6 @@ use crate::archive::{
     InvalidArchive, check_fields, scalars_are_canonical, unarchive,
 };
 use crate::error::Error;
-use crate::util;
 
 /// Represents a polynomial in coeffiient form.
 #[derive(Debug, Eq, PartialEq, Clone)]
@@ -162,22 +161,19 @@ impl Polynomial {
 
     /// Evaluates a [`Polynomial`] at a given value in the field.
     pub(crate) fn evaluate(&self, value: &BlsScalar) -> BlsScalar {
-        if self.is_zero() {
-            return BlsScalar::zero();
+        #[cfg(feature = "std")]
+        {
+            crate::fast_fr::poly_evaluate_fast(&self.coeffs, value)
         }
-
-        // Compute powers of the value
-        let powers = util::powers_of(value, self.len() - 1);
-
-        // Multiply the powers of the value by the coefficients
-        let mul_coeff = self.iter().zip(powers).map(|(c, p)| p * c);
-
-        // Sum it all up
-        let mut sum = BlsScalar::zero();
-        for value in mul_coeff {
-            sum += &value;
+        #[cfg(not(feature = "std"))]
+        {
+            let mut result = BlsScalar::zero();
+            for coeff in self.coeffs.iter().rev() {
+                result *= value;
+                result += coeff;
+            }
+            result
         }
-        sum
     }
 
     /// Given a [`Polynomial`], return it in it's bytes representation
@@ -388,27 +384,30 @@ impl Polynomial {
     ///
     /// Returns the quotient and discards the remainder, which is `self(z)`.
     pub fn ruffini(&self, z: BlsScalar) -> Polynomial {
-        let quotient_len = self.coeffs.len().saturating_sub(1);
-        let mut quotient = Vec::with_capacity(quotient_len);
-        let mut coefficients = self.coeffs.iter().rev().take(quotient_len);
-
-        // Reverse the results and use Ruffini's method to compute the quotient
-        // The coefficients must be reversed as Ruffini's method
-        // starts with the leading coefficient, while Polynomials
-        // are stored in increasing order i.e. the leading coefficient is the
-        // last element
-        if let Some(coefficient) = coefficients.next() {
-            let mut value = *coefficient;
-            quotient.push(value);
-            for coefficient in coefficients {
-                value = coefficient + z * value;
-                quotient.push(value);
-            }
+        #[cfg(feature = "std")]
+        {
+            Polynomial::from_coefficients_vec(
+                crate::fast_fr::poly_ruffini_fast(&self.coeffs, &z),
+            )
         }
+        #[cfg(not(feature = "std"))]
+        {
+            let quotient_len = self.coeffs.len().saturating_sub(1);
+            let mut quotient = Vec::with_capacity(quotient_len);
+            let mut coefficients = self.coeffs.iter().rev().take(quotient_len);
 
-        // Reverse the results for storage in the Polynomial struct
-        quotient.reverse();
-        Polynomial::from_coefficients_vec(quotient)
+            if let Some(coefficient) = coefficients.next() {
+                let mut value = *coefficient;
+                quotient.push(value);
+                for coefficient in coefficients {
+                    value = coefficient + z * value;
+                    quotient.push(value);
+                }
+            }
+
+            quotient.reverse();
+            Polynomial::from_coefficients_vec(quotient)
+        }
     }
 }
 
@@ -515,6 +514,30 @@ mod test {
         let constant =
             Polynomial::from_coefficients_vec(vec![BlsScalar::from(7)]);
         assert_eq!(constant.evaluate(&BlsScalar::from(5)), BlsScalar::from(7));
+    }
+
+    #[test]
+    fn test_evaluate_horner_matches_power_sum() {
+        let mut rng = StdRng::seed_from_u64(0x5150);
+        let point = BlsScalar::random(&mut rng);
+        assert_eq!(Polynomial::zero().evaluate(&point), BlsScalar::zero());
+
+        for degree in [0usize, 1, 2, 17, 257] {
+            let poly = Polynomial::rand(degree, &mut rng);
+            let mut expected = BlsScalar::zero();
+            let mut pow = BlsScalar::one();
+            for coeff in poly.iter() {
+                expected += *coeff * pow;
+                pow *= point;
+            }
+            assert_eq!(poly.evaluate(&point), expected);
+
+            let mut padded = poly.coeffs.clone();
+            padded.push(BlsScalar::zero());
+            padded.push(BlsScalar::zero());
+            let untrimmed = Polynomial::from_coefficients_untrimmed(padded);
+            assert_eq!(untrimmed.evaluate(&point), expected);
+        }
     }
 
     #[test]

@@ -15,6 +15,7 @@ cfg_if::cfg_if!(
     if #[cfg(feature = "alloc")] {
         pub(crate) mod quotient_poly;
         pub(crate) mod preprocess;
+        pub(crate) mod verifier_msm;
 
         pub(crate) use widget::alloc::ProverKey;
         pub(crate) use widget::VerifierKey;

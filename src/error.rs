@@ -120,6 +120,8 @@ pub enum Error {
     LegacyProvingDisabled,
     /// The requested proving version is no longer supported.
     UnsupportedProvingVersion,
+    /// Batch verification received verifiers with different opening keys.
+    IncompatibleOpeningKey,
 }
 
 impl fmt::Display for Error {
@@ -222,6 +224,9 @@ impl fmt::Display for Error {
             Self::UnsupportedProvingVersion => {
                 write!(f, "requested proving version is unsupported")
             }
+            Self::IncompatibleOpeningKey => {
+                write!(f, "incompatible opening keys in batch verification")
+            }
         }
     }
 }
@@ -254,7 +259,7 @@ mod tests {
         assert!(matches!(bytes_error, Error::BytesError(_)));
 
         // Format each variant at least once so the `Display` impl gets covered.
-        let all_errors: [Error; 26] = [
+        let all_errors: [Error; 27] = [
             Error::InvalidEvalDomainSize {
                 log_size_of_group: 32,
                 adacity: 28,
@@ -284,6 +289,7 @@ mod tests {
             Error::InvalidCompressedCircuit,
             Error::LegacyProvingDisabled,
             Error::UnsupportedProvingVersion,
+            Error::IncompatibleOpeningKey,
         ];
 
         for e in all_errors {

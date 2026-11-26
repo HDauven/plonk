@@ -19,9 +19,9 @@ use crate::compiler::prover::linearization_poly::ProofEvaluations;
 use crate::error::Error;
 use crate::fft::{EvaluationDomain, Polynomial};
 use crate::proof_system::proof::Proof;
-use crate::proof_system::{
-    ProverKey, VerifierKey, linearization_poly, quotient_poly,
-};
+#[cfg(not(feature = "std"))]
+use crate::proof_system::quotient_poly;
+use crate::proof_system::{ProverKey, VerifierKey, linearization_poly};
 use crate::transcript::TranscriptProtocol;
 use crate::util::batch_inversion;
 
@@ -34,12 +34,21 @@ pub struct Prover {
     label: Vec<u8>,
     pub(crate) prover_key: ProverKey,
     pub(crate) commit_key: CommitKey,
+    #[cfg(feature = "blst-backend")]
+    blst_powers: alloc::sync::Arc<Vec<blst::blst_p1_affine>>,
+    #[cfg(feature = "blst-backend")]
+    blst_lagrange_powers:
+        alloc::sync::Arc<std::sync::OnceLock<Vec<blst::blst_p1_affine>>>,
     pub(crate) verifier_key: VerifierKey,
     pub(crate) transcript: Transcript,
     sigma_evaluations: [Vec<BlsScalar>; 4],
     domain: EvaluationDomain,
+    #[cfg_attr(feature = "std", allow(dead_code))]
     quotient_domain: EvaluationDomain,
+    #[cfg_attr(feature = "std", allow(dead_code))]
     vanishing_coset_inverses: [BlsScalar; 8],
+    #[cfg(feature = "std")]
+    fast_cache: crate::fast_quotient::FastProverCache,
     pub(crate) size: usize,
     pub(crate) constraints: usize,
     public_input_indexes: Vec<usize>,
@@ -115,16 +124,38 @@ impl Prover {
             domain.fft(&prover_key.permutation.s_sigma_4.0),
         ];
 
+        #[cfg(feature = "std")]
+        let fast_cache = crate::fast_quotient::FastProverCache::new(
+            &domain,
+            &quotient_domain,
+            &prover_key,
+            &vanishing_coset_inverses,
+        );
+
+        #[cfg(feature = "blst-backend")]
+        let blst_powers = alloc::sync::Arc::new(
+            crate::blst_backend::g1_affines_to_blst(&commit_key.powers_of_g),
+        );
+        #[cfg(feature = "blst-backend")]
+        let blst_lagrange_powers =
+            alloc::sync::Arc::new(std::sync::OnceLock::new());
+
         Ok(Self {
             label,
             prover_key,
             commit_key,
+            #[cfg(feature = "blst-backend")]
+            blst_powers,
+            #[cfg(feature = "blst-backend")]
+            blst_lagrange_powers,
             verifier_key,
             transcript,
             sigma_evaluations,
             domain,
             quotient_domain,
             vanishing_coset_inverses,
+            #[cfg(feature = "std")]
+            fast_cache,
             size,
             constraints,
             public_input_indexes,
@@ -139,6 +170,7 @@ impl Prover {
     /// if hiding degree = 1: (b2*X^(n+1) + b1*X^n - b2*X - b1) + witnesses
     /// if hiding degree = 2: (b3*X^(n+2) + b2*X^(n+1) + b1*X^n - b3*X^2 - b2*X
     /// - b1) + witnesses
+    #[cfg_attr(feature = "std", allow(dead_code))]
     pub(crate) fn blind_poly<R>(
         rng: &mut R,
         witnesses: &[BlsScalar],
@@ -151,15 +183,26 @@ impl Prover {
         let blinders: Vec<_> = (0..=hiding_degree)
             .map(|_| BlsScalar::random(&mut *rng))
             .collect();
-        Self::blind_poly_with_blinders(witnesses, &blinders, domain)
+        Self::blind_poly_with_blinders(
+            witnesses, &blinders, domain, None, false,
+        )
     }
 
+    #[cfg_attr(feature = "std", allow(dead_code))]
     fn blind_poly_with_blinders(
         witnesses: &[BlsScalar],
         blinders: &[BlsScalar],
         domain: &EvaluationDomain,
+        ifft_roots: Option<&[BlsScalar]>,
+        serial_inner: bool,
     ) -> Polynomial {
-        let mut coefficients = domain.ifft(witnesses);
+        let mut coefficients = match ifft_roots {
+            Some(roots) if serial_inner => {
+                domain.serial_ifft_with_roots(witnesses, roots)
+            }
+            Some(roots) => domain.ifft_with_roots(witnesses, roots),
+            None => domain.ifft(witnesses),
+        };
 
         for (i, blinding_scalar) in blinders.iter().copied().enumerate() {
             coefficients[i] -= blinding_scalar;
@@ -176,6 +219,7 @@ impl Prover {
         core::array::from_fn(|_| BlsScalar::random(&mut *rng))
     }
 
+    #[cfg_attr(feature = "std", allow(dead_code))]
     fn blind_wire_polynomials(
         witnesses: [&[BlsScalar]; 4],
         blinders: &[BlsScalar; 11],
@@ -190,8 +234,18 @@ impl Prover {
             &blinders[6..8],
             &blinders[8..],
         ];
+        let ifft_roots = domain.precompute_ifft_roots();
+        // Up to 2^15, running each of the 4 parallel wire IFFTs on its own
+        // thread without nested Rayon barriers avoids contention.
+        let serial_inner = domain.size() <= (1 << 15);
         let blind = |i: usize| {
-            Self::blind_poly_with_blinders(witnesses[i], blinders[i], domain)
+            Self::blind_poly_with_blinders(
+                witnesses[i],
+                blinders[i],
+                domain,
+                Some(&ifft_roots),
+                serial_inner,
+            )
         };
         #[cfg(feature = "std")]
         {
@@ -208,28 +262,92 @@ impl Prover {
         }
     }
 
-    fn commit_polynomials(
-        &self,
-        polynomials: [&Polynomial; 4],
-    ) -> Result<[Commitment; 4], Error> {
+    fn evaluate_polynomials<const N: usize>(
+        targets: &[(&Polynomial, BlsScalar); N],
+        domain_size: usize,
+    ) -> [BlsScalar; N] {
         #[cfg(feature = "std")]
         {
-            let commit = |i: usize| self.commit_key.commit(polynomials[i]);
-            let ((a, b), (c, d)) = rayon::join(
-                || rayon::join(|| commit(0), || commit(1)),
-                || rayon::join(|| commit(2), || commit(3)),
-            );
-            Ok([a?, b?, c?, d?])
+            const PARALLEL_EVAL_MIN_DOMAIN: usize = 1 << 10;
+            if domain_size >= PARALLEL_EVAL_MIN_DOMAIN
+                && rayon::current_num_threads() > 1
+            {
+                use rayon::prelude::*;
+
+                let mut values = [BlsScalar::zero(); N];
+                values.par_iter_mut().zip(&targets[..]).for_each(
+                    |(slot, (poly, point))| {
+                        *slot = poly.evaluate(point);
+                    },
+                );
+                return values;
+            }
+        }
+
+        let _ = domain_size;
+        core::array::from_fn(|i| targets[i].0.evaluate(&targets[i].1))
+    }
+
+    fn commit_one(&self, polynomial: &Polynomial) -> Result<Commitment, Error> {
+        #[cfg(feature = "blst-backend")]
+        {
+            if polynomial.degree() > self.commit_key.max_degree()
+                || polynomial.len() > self.blst_powers.len()
+            {
+                return Err(Error::PolynomialDegreeTooLarge);
+            }
+            Ok(Commitment::from(crate::blst_backend::msm_g1(
+                &self.blst_powers,
+                polynomial,
+            )))
+        }
+        #[cfg(not(feature = "blst-backend"))]
+        {
+            self.commit_key.commit(polynomial)
+        }
+    }
+
+    fn commit_polynomials<const K: usize>(
+        &self,
+        polynomials: [&Polynomial; K],
+    ) -> Result<[Commitment; K], Error> {
+        #[cfg(feature = "blst-backend")]
+        {
+            let max_degree = self.commit_key.max_degree();
+            let max_len = self.blst_powers.len();
+            for poly in &polynomials {
+                if poly.degree() > max_degree || poly.len() > max_len {
+                    return Err(Error::PolynomialDegreeTooLarge);
+                }
+            }
+            let raw = polynomials.map(|p| &p[..]);
+            let affines =
+                crate::blst_backend::msm_g1_batch(&self.blst_powers, raw);
+            Ok(affines.map(Commitment::from))
+        }
+
+        #[cfg(all(feature = "std", not(feature = "blst-backend")))]
+        {
+            use rayon::prelude::*;
+
+            let mut results: Vec<Result<Commitment, Error>> = polynomials
+                .par_iter()
+                .map(|poly| self.commit_key.commit(poly))
+                .collect();
+            let mut out = [Commitment::default(); K];
+            for (slot, res) in out.iter_mut().zip(results.drain(..)) {
+                *slot = res?;
+            }
+            Ok(out)
         }
 
         #[cfg(not(feature = "std"))]
         {
-            Ok([
-                self.commit_key.commit(polynomials[0])?,
-                self.commit_key.commit(polynomials[1])?,
-                self.commit_key.commit(polynomials[2])?,
-                self.commit_key.commit(polynomials[3])?,
-            ])
+            let mut out = [Commitment::default(); K];
+            for (slot, poly) in out.iter_mut().zip(polynomials.iter()) {
+                *slot = self.commit_key.commit(poly)?;
+            }
+            Ok(out)
         }
     }
 
@@ -515,7 +633,24 @@ impl Prover {
         C: Circuit,
         R: RngCore + CryptoRng,
     {
-        let prover = Composer::prove(self.constraints, circuit)?;
+        #[cfg(feature = "std")]
+        let prof = {
+            static ENABLED: std::sync::OnceLock<bool> =
+                std::sync::OnceLock::new();
+            *ENABLED.get_or_init(|| {
+                std::env::var_os("PLONK_STAGE_PROFILE").is_some()
+            })
+        };
+        #[cfg(feature = "std")]
+        let t_start = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
+        let prover = Composer::prove_fast(self.constraints, circuit)?;
+        #[cfg(feature = "std")]
+        let t_composer = t_start.map(|_| std::time::Instant::now());
 
         let size = self.size;
         let domain = self.domain;
@@ -540,12 +675,6 @@ impl Prover {
                     .ok_or(Error::PublicInputNotFound { index: *index })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let dense_public_inputs = Composer::dense_public_inputs(
-            &self.public_input_indexes,
-            &public_inputs,
-            self.size,
-        );
-
         public_inputs
             .iter()
             .for_each(|pi| transcript.append_scalar(b"pi", pi));
@@ -557,29 +686,116 @@ impl Prover {
         let mut c_scalars = vec![BlsScalar::zero(); size];
         let mut d_scalars = vec![BlsScalar::zero(); size];
 
-        prover
-            .constraints
-            .iter()
-            .enumerate()
-            .for_each(|(i, constraint)| {
-                a_scalars[i] = prover[constraint.a];
-                b_scalars[i] = prover[constraint.b];
-                c_scalars[i] = prover[constraint.c];
-                d_scalars[i] = prover[constraint.d];
-            });
+        if prover.proving_only {
+            prover.wire_rows.iter().enumerate().for_each(
+                |(i, &[a, b, c, d])| {
+                    a_scalars[i] = prover[a];
+                    b_scalars[i] = prover[b];
+                    c_scalars[i] = prover[c];
+                    d_scalars[i] = prover[d];
+                },
+            );
+        } else {
+            prover.constraints.iter().enumerate().for_each(
+                |(i, constraint)| {
+                    a_scalars[i] = prover[constraint.a];
+                    b_scalars[i] = prover[constraint.b];
+                    c_scalars[i] = prover[constraint.c];
+                    d_scalars[i] = prover[constraint.d];
+                },
+            );
+        }
 
         let wire_blinders = Self::sample_wire_blinders(rng);
 
+        #[cfg(feature = "std")]
+        let [a_poly, b_poly, c_poly, d_poly] = {
+            let blinder_slices = [
+                &wire_blinders[..3],
+                &wire_blinders[3..6],
+                &wire_blinders[6..8],
+                &wire_blinders[8..],
+            ];
+            let witness_slices = [
+                a_scalars.as_slice(),
+                b_scalars.as_slice(),
+                c_scalars.as_slice(),
+                d_scalars.as_slice(),
+            ];
+            let blind_fast = |i: usize| {
+                let mut coeffs = crate::fast_fr::serial_ifft_bls_fast(
+                    witness_slices[i],
+                    &self.fast_cache.domain_ifft_roots,
+                    self.fast_cache.domain_size_inv,
+                    domain.log_size_of_group,
+                );
+                for (j, blinding_scalar) in
+                    blinder_slices[i].iter().copied().enumerate()
+                {
+                    coeffs[j] -= blinding_scalar;
+                    coeffs.push(blinding_scalar);
+                }
+                Polynomial::from_coefficients_vec(coeffs)
+            };
+            let ((a, b), (c, d)) = rayon::join(
+                || rayon::join(|| blind_fast(0), || blind_fast(1)),
+                || rayon::join(|| blind_fast(2), || blind_fast(3)),
+            );
+            [a, b, c, d]
+        };
+        #[cfg(not(feature = "std"))]
         let [a_poly, b_poly, c_poly, d_poly] = Self::blind_wire_polynomials(
             [&a_scalars, &b_scalars, &c_scalars, &d_scalars],
             &wire_blinders,
             &domain,
         );
+        #[cfg(feature = "std")]
+        let t_wire_ifft = t_start.map(|_| std::time::Instant::now());
 
         // commit to wire polynomials
         // ([a(x)]_1, [b(x)]_1, [c(x)]_1, [d(x)]_1)
+        #[cfg(feature = "blst-backend")]
+        let [a_comm, b_comm, c_comm, d_comm] = {
+            if size + 3 <= self.blst_powers.len()
+                && a_poly.degree() <= self.commit_key.max_degree()
+                && b_poly.degree() <= self.commit_key.max_degree()
+                && c_poly.degree() <= self.commit_key.max_degree()
+                && d_poly.degree() <= self.commit_key.max_degree()
+            {
+                let lagrange_powers =
+                    self.blst_lagrange_powers.get_or_init(|| {
+                        crate::blst_backend::g1_ifft_blst(
+                            &self.blst_powers[..size],
+                            &domain,
+                        )
+                    });
+                let blinder_slices = [
+                    &wire_blinders[..3],
+                    &wire_blinders[3..6],
+                    &wire_blinders[6..8],
+                    &wire_blinders[8..],
+                ];
+                let affines = crate::blst_backend::msm_g1_lagrange_batch(
+                    lagrange_powers,
+                    &self.blst_powers,
+                    [
+                        a_scalars.as_slice(),
+                        b_scalars.as_slice(),
+                        c_scalars.as_slice(),
+                        d_scalars.as_slice(),
+                    ],
+                    blinder_slices,
+                );
+                affines.map(Commitment::from)
+            } else {
+                self.commit_polynomials([&a_poly, &b_poly, &c_poly, &d_poly])?
+            }
+        };
+        #[cfg(not(feature = "blst-backend"))]
         let [a_comm, b_comm, c_comm, d_comm] =
             self.commit_polynomials([&a_poly, &b_poly, &c_poly, &d_poly])?;
+        #[cfg(feature = "std")]
+        let t_wire_msm = t_start.map(|_| std::time::Instant::now());
 
         // Add wire polynomial commitments to transcript
         transcript.append_commitment(b"a_comm", &a_comm);
@@ -609,8 +825,29 @@ impl Prover {
             .perm
             .compute_permutation_vec(&domain, wires, &beta, &gamma, sigma);
 
+        #[cfg(feature = "std")]
+        let z_poly = {
+            let blinders: [BlsScalar; 3] =
+                core::array::from_fn(|_| BlsScalar::random(&mut *rng));
+            let mut coeffs = crate::fast_fr::serial_ifft_bls_fast(
+                &permutation,
+                &self.fast_cache.domain_ifft_roots,
+                self.fast_cache.domain_size_inv,
+                domain.log_size_of_group,
+            );
+            for (j, blinding_scalar) in blinders.into_iter().enumerate() {
+                coeffs[j] -= blinding_scalar;
+                coeffs.push(blinding_scalar);
+            }
+            Polynomial::from_coefficients_vec(coeffs)
+        };
+        #[cfg(not(feature = "std"))]
         let z_poly = Self::blind_poly(rng, &permutation, 2, &domain);
-        let z_comm = self.commit_key.commit(&z_poly)?;
+        #[cfg(feature = "std")]
+        let t_perm = t_start.map(|_| std::time::Instant::now());
+        let z_comm = self.commit_one(&z_poly)?;
+        #[cfg(feature = "std")]
+        let t_z_msm = t_start.map(|_| std::time::Instant::now());
         transcript.append_commitment(b"z_comm", &z_comm);
 
         // round 3
@@ -626,8 +863,26 @@ impl Prover {
             transcript.challenge_scalar(b"variable base separation challenge");
 
         // compute public inputs polynomial
-        let pi_poly = domain.ifft(&dense_public_inputs);
-        let pi_poly = Polynomial::from_coefficients_vec(pi_poly);
+        let pi_poly = if public_inputs.iter().all(|pi| *pi == BlsScalar::zero())
+        {
+            Polynomial::zero()
+        } else {
+            let dense_public_inputs = Composer::dense_public_inputs(
+                &self.public_input_indexes,
+                &public_inputs,
+                self.size,
+            );
+            #[cfg(feature = "std")]
+            let coeffs = crate::fast_fr::serial_ifft_bls_fast(
+                &dense_public_inputs,
+                &self.fast_cache.domain_ifft_roots,
+                self.fast_cache.domain_size_inv,
+                domain.log_size_of_group,
+            );
+            #[cfg(not(feature = "std"))]
+            let coeffs = domain.ifft(&dense_public_inputs);
+            Polynomial::from_coefficients_vec(coeffs)
+        };
 
         // compute quotient polynomial
         let wires = (&a_poly, &b_poly, &c_poly, &d_poly);
@@ -640,24 +895,41 @@ impl Prover {
             fixed_base_sep_challenge,
             var_base_sep_challenge,
         );
-        let t_poly = quotient_poly::compute(
-            &self.quotient_domain,
-            &self.prover_key,
-            &z_poly,
-            wires,
-            &pi_poly,
-            &self.vanishing_coset_inverses,
-            args,
-        )?;
-
-        // Split at multiples of n. The first three chunks have degree at
-        // most n after blinding; the fourth can have degree n + 9.
-        let domain_size = domain.size();
-
-        let mut t_low_vec = t_poly[0..domain_size].to_vec();
-        let mut t_mid_vec = t_poly[domain_size..2 * domain_size].to_vec();
-        let mut t_high_vec = t_poly[2 * domain_size..3 * domain_size].to_vec();
-        let mut t_fourth_vec = t_poly[3 * domain_size..].to_vec();
+        #[cfg(feature = "std")]
+        let [
+            mut t_low_vec,
+            mut t_mid_vec,
+            mut t_high_vec,
+            mut t_fourth_vec,
+        ] = self
+            .fast_cache
+            .compute_split_quotient(&domain, &z_poly, wires, &pi_poly, args)?;
+        #[cfg(not(feature = "std"))]
+        let [
+            mut t_low_vec,
+            mut t_mid_vec,
+            mut t_high_vec,
+            mut t_fourth_vec,
+        ] = {
+            let t_poly = quotient_poly::compute(
+                &self.quotient_domain,
+                &self.prover_key,
+                &z_poly,
+                wires,
+                &pi_poly,
+                &self.vanishing_coset_inverses,
+                args,
+            )?;
+            let domain_size = domain.size();
+            [
+                t_poly[0..domain_size].to_vec(),
+                t_poly[domain_size..2 * domain_size].to_vec(),
+                t_poly[2 * domain_size..3 * domain_size].to_vec(),
+                t_poly[3 * domain_size..].to_vec(),
+            ]
+        };
+        #[cfg(feature = "std")]
+        let t_quot = t_start.map(|_| std::time::Instant::now());
 
         // select 3 blinding factors for the quotient splitted polynomials
         let b_12 = BlsScalar::random(&mut *rng);
@@ -691,6 +963,8 @@ impl Prover {
                 &t_high_poly,
                 &t_fourth_poly,
             ])?;
+        #[cfg(feature = "std")]
+        let t_quot_msm = t_start.map(|_| std::time::Instant::now());
 
         // add quotient polynomial commitments to transcript
         transcript.append_commitment(b"t_low_comm", &t_low_comm);
@@ -701,33 +975,48 @@ impl Prover {
         // round 4
         // compute evaluation challenge 'z'
         let z_challenge = transcript.challenge_scalar(b"z_challenge");
+        let z_w_challenge = z_challenge * domain.group_gen;
 
-        // compute opening evaluations
-        let a_eval = a_poly.evaluate(&z_challenge);
-        let b_eval = b_poly.evaluate(&z_challenge);
-        let c_eval = c_poly.evaluate(&z_challenge);
-        let d_eval = d_poly.evaluate(&z_challenge);
+        // compute opening, shifted, and selector evaluations
+        let eval_targets: [(&Polynomial, BlsScalar); 15] = [
+            (&a_poly, z_challenge),
+            (&b_poly, z_challenge),
+            (&c_poly, z_challenge),
+            (&d_poly, z_challenge),
+            (&self.prover_key.permutation.s_sigma_1.0, z_challenge),
+            (&self.prover_key.permutation.s_sigma_2.0, z_challenge),
+            (&self.prover_key.permutation.s_sigma_3.0, z_challenge),
+            (&z_poly, z_w_challenge),
+            (&a_poly, z_w_challenge),
+            (&b_poly, z_w_challenge),
+            (&d_poly, z_w_challenge),
+            // These selector/constant polynomials are shared across widgets.
+            // Evaluate them from the arithmetic key to match transcript-seeded
+            // commitments under the corresponding labels.
+            (&self.prover_key.arithmetic.q_arith.0, z_challenge),
+            (&self.prover_key.arithmetic.q_c.0, z_challenge),
+            (&self.prover_key.arithmetic.q_l.0, z_challenge),
+            (&self.prover_key.arithmetic.q_r.0, z_challenge),
+        ];
 
-        let s_sigma_1_eval = self
-            .prover_key
-            .permutation
-            .s_sigma_1
-            .0
-            .evaluate(&z_challenge);
-        let s_sigma_2_eval = self
-            .prover_key
-            .permutation
-            .s_sigma_2
-            .0
-            .evaluate(&z_challenge);
-        let s_sigma_3_eval = self
-            .prover_key
-            .permutation
-            .s_sigma_3
-            .0
-            .evaluate(&z_challenge);
-
-        let z_eval = z_poly.evaluate(&(z_challenge * domain.group_gen));
+        let eval_values = Self::evaluate_polynomials(&eval_targets, size);
+        let [
+            a_eval,
+            b_eval,
+            c_eval,
+            d_eval,
+            s_sigma_1_eval,
+            s_sigma_2_eval,
+            s_sigma_3_eval,
+            z_eval,
+            a_w_eval,
+            b_w_eval,
+            d_w_eval,
+            q_arith_eval,
+            q_c_eval,
+            q_l_eval,
+            q_r_eval,
+        ] = eval_values;
 
         // add opening evaluations to transcript.
         transcript.append_scalar(b"a_eval", &a_eval);
@@ -740,21 +1029,6 @@ impl Prover {
         transcript.append_scalar(b"s_sigma_3_eval", &s_sigma_3_eval);
 
         transcript.append_scalar(b"z_eval", &z_eval);
-
-        // compute shifted evaluations
-        let a_w_eval = a_poly.evaluate(&(z_challenge * domain.group_gen));
-        let b_w_eval = b_poly.evaluate(&(z_challenge * domain.group_gen));
-        let d_w_eval = d_poly.evaluate(&(z_challenge * domain.group_gen));
-
-        // compute selector evaluations
-        let q_arith_eval =
-            self.prover_key.arithmetic.q_arith.0.evaluate(&z_challenge);
-        // These selector/constant polynomials are shared across widgets.
-        // Evaluate them from the arithmetic key to match transcript-seeded
-        // commitments under the corresponding labels.
-        let q_c_eval = self.prover_key.arithmetic.q_c.0.evaluate(&z_challenge);
-        let q_l_eval = self.prover_key.arithmetic.q_l.0.evaluate(&z_challenge);
-        let q_r_eval = self.prover_key.arithmetic.q_r.0.evaluate(&z_challenge);
 
         // add shifted evaluations to transcript
         transcript.append_scalar(b"a_w_eval", &a_w_eval);
@@ -786,8 +1060,9 @@ impl Prover {
         };
 
         // round 5
-        // compute the challenge 'v'
+        // compute the opening challenges 'v' and 'v_w'
         let v_challenge = transcript.challenge_scalar(b"v_challenge");
+        let v_w_challenge = transcript.challenge_scalar(b"v_w_challenge");
 
         // compute linearization polynomial
         let r_poly = linearization_poly::compute(
@@ -812,41 +1087,90 @@ impl Prover {
             &public_inputs,
         );
 
-        // compute the opening proof polynomial 'W_z(X)'
-        let aggregate_witness = CommitKey::compute_aggregate_witness(
-            &[
-                &r_poly,
-                &a_poly,
-                &b_poly,
-                &c_poly,
-                &d_poly,
-                &self.prover_key.permutation.s_sigma_1.0,
-                &self.prover_key.permutation.s_sigma_2.0,
-                &self.prover_key.permutation.s_sigma_3.0,
-                // Bind selector evaluations (q_*) used inside the verifier
-                // linearization commitment to their committed polynomials
-                // by including them in the same batched opening at `z`.
-                &self.prover_key.arithmetic.q_arith.0,
-                &self.prover_key.arithmetic.q_c.0,
-                &self.prover_key.arithmetic.q_l.0,
-                &self.prover_key.arithmetic.q_r.0,
-            ],
-            &z_challenge,
-            &v_challenge,
-        );
-        let w_z_chall_comm = self.commit_key.commit(&aggregate_witness)?;
+        let build_w_z = || {
+            // compute the opening proof polynomial 'W_z(X)'
+            CommitKey::compute_aggregate_witness(
+                &[
+                    &r_poly,
+                    &a_poly,
+                    &b_poly,
+                    &c_poly,
+                    &d_poly,
+                    &self.prover_key.permutation.s_sigma_1.0,
+                    &self.prover_key.permutation.s_sigma_2.0,
+                    &self.prover_key.permutation.s_sigma_3.0,
+                    // Bind selector evaluations (q_*) used inside the verifier
+                    // linearization commitment to their committed polynomials
+                    // by including them in the same batched opening at `z`.
+                    &self.prover_key.arithmetic.q_arith.0,
+                    &self.prover_key.arithmetic.q_c.0,
+                    &self.prover_key.arithmetic.q_l.0,
+                    &self.prover_key.arithmetic.q_r.0,
+                ],
+                &z_challenge,
+                &v_challenge,
+            )
+        };
 
-        // compute the shifted challenge 'v_w'
-        let v_w_challenge = transcript.challenge_scalar(b"v_w_challenge");
+        let build_w_zw = || {
+            // compute the shifted opening proof polynomial 'W_zw(X)'
+            CommitKey::compute_aggregate_witness(
+                &[&z_poly, &a_poly, &b_poly, &d_poly],
+                &z_w_challenge,
+                &v_w_challenge,
+            )
+        };
 
-        // compute the shifted opening proof polynomial 'W_zw(X)'
-        let shifted_aggregate_witness = CommitKey::compute_aggregate_witness(
-            &[&z_poly, &a_poly, &b_poly, &d_poly],
-            &(z_challenge * domain.group_gen),
-            &v_w_challenge,
-        );
-        let w_z_chall_w_comm =
-            self.commit_key.commit(&shifted_aggregate_witness)?;
+        #[cfg(feature = "std")]
+        let (aggregate_witness, shifted_aggregate_witness) =
+            rayon::join(build_w_z, build_w_zw);
+
+        #[cfg(not(feature = "std"))]
+        let (aggregate_witness, shifted_aggregate_witness) =
+            (build_w_z(), build_w_zw());
+
+        let [w_z_chall_comm, w_z_chall_w_comm] = self.commit_polynomials([
+            &aggregate_witness,
+            &shifted_aggregate_witness,
+        ])?;
+
+        #[cfg(feature = "std")]
+        if let (
+            Some(t0),
+            Some(tc),
+            Some(twi),
+            Some(twm),
+            Some(tp),
+            Some(tzm),
+            Some(tq),
+            Some(tqm),
+        ) = (
+            t_start,
+            t_composer,
+            t_wire_ifft,
+            t_wire_msm,
+            t_perm,
+            t_z_msm,
+            t_quot,
+            t_quot_msm,
+        ) {
+            let tend = std::time::Instant::now();
+            let ms = |a: std::time::Instant, b: std::time::Instant| {
+                b.duration_since(a).as_secs_f64() * 1e3
+            };
+            std::eprintln!(
+                "[stage n={size:5}] total={:6.2}ms | composer={:5.2} wire_ifft={:5.2} wire_msm={:5.2} perm+z_ifft={:5.2} z_msm={:5.2} quot={:6.2} quot_msm={:5.2} r4+r5={:5.2}",
+                ms(t0, tend),
+                ms(t0, tc),
+                ms(tc, twi),
+                ms(twi, twm),
+                ms(twm, tp),
+                ms(tp, tzm),
+                ms(tzm, tq),
+                ms(tq, tqm),
+                ms(tqm, tend),
+            );
+        }
 
         let proof = Proof {
             a_comm,
@@ -1590,6 +1914,120 @@ mod tests {
                 result.expect("checked above"),
                 Err(Error::NotEnoughBytes)
             ));
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn deterministic_proof_is_bit_identical_across_thread_counts_and_pi_modes()
+    {
+        use dusk_jubjub::{JubJubExtended, JubJubScalar};
+
+        use crate::composer::TorsionFreeWitnessPoint;
+
+        struct MixedCircuit {
+            public_value: Option<BlsScalar>,
+            bad_witness: bool,
+        }
+
+        impl Circuit for MixedCircuit {
+            fn circuit(&self, composer: &mut Composer) -> Result<(), Error> {
+                let a_val = if self.bad_witness {
+                    BlsScalar::from(3u64)
+                } else {
+                    BlsScalar::from(2u64)
+                };
+                let a = composer.append_witness(a_val);
+                let b = composer.append_witness(BlsScalar::from(3u64));
+                let y = composer.append_witness(JubJubScalar::from(7u64));
+                let z = composer.append_point(
+                    JubJubExtended::from(dusk_jubjub::GENERATOR_EXTENDED)
+                        * JubJubScalar::from(7u64),
+                )?;
+                let tf_z = TorsionFreeWitnessPoint::new_unchecked(z);
+
+                if let Some(pi) = self.public_value {
+                    composer.append_public(pi);
+                }
+
+                for _ in 0..4 {
+                    let prod =
+                        composer.gate_mul(Constraint::new().mult(1).a(a).b(b));
+                    composer.assert_equal_constant(
+                        prod,
+                        BlsScalar::from(6u64),
+                        None,
+                    );
+                    composer.component_range_bits::<32>(a);
+                    composer.append_logic_and::<16>(a, b);
+                    composer.append_logic_xor::<16>(a, b);
+                    composer.component_add_point(tf_z, tf_z);
+                    composer.component_mul_generator(
+                        y,
+                        dusk_jubjub::GENERATOR_EXTENDED,
+                    )?;
+                }
+                Ok(())
+            }
+        }
+
+        let mut setup_rng = StdRng::seed_from_u64(0xCAFE_BABE);
+        let pp = PublicParameters::setup(1 << 12, &mut setup_rng).unwrap();
+
+        for public_value in [
+            None,
+            Some(BlsScalar::zero()),
+            Some(BlsScalar::from(12345u64)),
+        ] {
+            let circuit = MixedCircuit {
+                public_value,
+                bad_witness: false,
+            };
+            let (prover, verifier) =
+                Compiler::compile_with_circuit(&pp, b"det-threads", &circuit)
+                    .unwrap();
+            // Ensure 8n >= 16384 so parallel FFT & parallel quotient chunks
+            // run.
+            assert!(prover.quotient_domain.size() >= (1 << 14));
+
+            let ref_pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap();
+            let (ref_proof, ref_pi) = ref_pool.install(|| {
+                let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF);
+                prover.prove(&mut rng, &circuit).unwrap()
+            });
+            verifier.verify(&ref_proof, &ref_pi).unwrap();
+            let ref_bytes = ref_proof.to_bytes();
+
+            for threads in [3, 4, 8, 9] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                let (proof, pi) = pool.install(|| {
+                    let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF);
+                    prover.prove(&mut rng, &circuit).unwrap()
+                });
+                assert_eq!(
+                    proof.to_bytes(),
+                    ref_bytes,
+                    "proof bytes differed for pi={public_value:?} with {threads} threads"
+                );
+                assert_eq!(pi, ref_pi);
+                verifier.verify(&proof, &pi).unwrap();
+            }
+
+            let bad_circuit = MixedCircuit {
+                public_value,
+                bad_witness: true,
+            };
+            let mut bad_rng = StdRng::seed_from_u64(0xBAD0_C0DE);
+            assert_eq!(
+                prover.prove(&mut bad_rng, &bad_circuit),
+                Err(Error::CircuitUnsatisfied)
+            );
         }
     }
 }

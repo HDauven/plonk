@@ -60,6 +60,13 @@ pub struct Composer {
 
     /// PLONK runtime controller
     pub(crate) runtime: Runtime,
+
+    /// Fast proving-only mode: skips `Permutation::witness_map` and full
+    /// selector `Gate` copies, storing only `[Witness; 4]` per row.
+    pub(crate) proving_only: bool,
+
+    /// Compact wire indices populated when `proving_only` is true.
+    pub(crate) wire_rows: Vec<[Witness; 4]>,
 }
 
 impl ops::Index<Witness> for Composer {
@@ -93,8 +100,13 @@ impl Composer {
     pub const ZERO: Witness = Witness::ZERO;
 
     /// Constraints count
+    #[inline]
     pub fn constraints(&self) -> usize {
-        self.constraints.len()
+        if self.proving_only {
+            self.wire_rows.len()
+        } else {
+            self.constraints.len()
+        }
     }
 
     /// Create a [`Composer`] instance from a compressed circuit
@@ -106,11 +118,14 @@ impl Composer {
     }
 
     /// Allocate a witness value into the composer and return its index.
+    #[inline]
     fn append_witness_internal(&mut self, witness: BlsScalar) -> Witness {
         let n = self.witnesses.len();
 
-        // Get a new Witness from the permutation
-        self.perm.new_witness();
+        // Get a new Witness from the permutation when compiling/testing.
+        if !self.proving_only {
+            self.perm.new_witness();
+        }
 
         // Bind the allocated witness
         self.witnesses.push(witness);
@@ -120,12 +135,29 @@ impl Composer {
 
     /// Append a new width-4 gate/constraint.
     fn append_custom_gate_internal(&mut self, constraint: Constraint) {
-        let n = self.constraints.len();
-
         let a = constraint.witness(WiredWitness::A);
         let b = constraint.witness(WiredWitness::B);
         let c = constraint.witness(WiredWitness::C);
         let d = constraint.witness(WiredWitness::D);
+
+        if self.proving_only {
+            let n = self.wire_rows.len();
+            let witness_len = self.witnesses.len();
+            assert!(
+                a.index() < witness_len
+                    && b.index() < witness_len
+                    && c.index() < witness_len
+                    && d.index() < witness_len
+            );
+            self.wire_rows.push([a, b, c, d]);
+            if constraint.has_public_input() {
+                let pi = *constraint.coeff(Selector::PublicInput);
+                self.public_inputs.insert(n, pi);
+            }
+            return;
+        }
+
+        let n = self.constraints.len();
 
         let q_m = *constraint.coeff(Selector::Multiplication);
         let q_l = *constraint.coeff(Selector::Left);
@@ -201,6 +233,43 @@ impl Composer {
             witnesses: Vec::new(),
             perm: Permutation::new(),
             runtime: Runtime::new(),
+            proving_only: false,
+            wire_rows: Vec::new(),
+        }
+    }
+
+    /// Initialize a proving-only constraint system preallocated for
+    /// `expected_constraints` rows, skipping compile-only permutation maps and
+    /// selector storage.
+    pub(crate) fn initialized_for_proving(expected_constraints: usize) -> Self {
+        #[cfg(feature = "debug")]
+        {
+            let _ = expected_constraints;
+            Self::initialized()
+        }
+        #[cfg(not(feature = "debug"))]
+        {
+            let mut slf = Self {
+                constraints: Vec::new(),
+                public_inputs: HashMap::new(),
+                witnesses: Vec::with_capacity(
+                    expected_constraints.saturating_mul(2).max(16),
+                ),
+                perm: Permutation::new(),
+                runtime: Runtime::new(),
+                proving_only: true,
+                wire_rows: Vec::with_capacity(expected_constraints),
+            };
+
+            let zero = slf.append_witness(0);
+            let one = slf.append_witness(1);
+
+            slf.assert_equal_constant(zero, 0, None);
+            slf.assert_equal_constant(one, 1, None);
+
+            slf.append_dummy_gates();
+
+            slf
         }
     }
 
@@ -331,17 +400,55 @@ impl Composer {
         let qc = s.coeff(Selector::Constant);
         let pi = s.coeff(Selector::PublicInput);
 
-        let x = qm * a * b + ql * a + qr * b + qf * d + qc + pi;
+        const ZERO: BlsScalar = BlsScalar::zero();
+        const ONE: BlsScalar = BlsScalar::one();
+
+        let mut x = *qc;
+        if *pi != ZERO {
+            x += pi;
+        }
+        if *qm != ZERO {
+            if *qm == ONE {
+                x += a * b;
+            } else if *qm == MINUS_ONE {
+                x -= a * b;
+            } else {
+                x += qm * a * b;
+            }
+        }
+        if *ql != ZERO {
+            if *ql == ONE {
+                x += a;
+            } else if *ql == MINUS_ONE {
+                x -= a;
+            } else {
+                x += ql * a;
+            }
+        }
+        if *qr != ZERO {
+            if *qr == ONE {
+                x += b;
+            } else if *qr == MINUS_ONE {
+                x -= b;
+            } else {
+                x += qr * b;
+            }
+        }
+        if *qf != ZERO {
+            if *qf == ONE {
+                x += d;
+            } else if *qf == MINUS_ONE {
+                x -= d;
+            } else {
+                x += qf * d;
+            }
+        }
 
         let y = s.coeff(Selector::Output);
 
         // Invert is an expensive operation; in most cases, `q_O` is going to be
         // either 1 or -1, so we can optimize these
         let c = {
-            const ONE: BlsScalar = BlsScalar::one();
-
-            // Can't use a match pattern here since `BlsScalar` doesn't derive
-            // `PartialEq`
             if y == &ONE {
                 Some(-x)
             } else if y == &MINUS_ONE {
@@ -438,6 +545,31 @@ impl Composer {
 
         self.append_evaluated_output(s)
             .expect("output selector is -1")
+    }
+
+    /// Fast proving-only circuit execution used by [`crate::compiler::Prover`].
+    pub(crate) fn prove_fast<C>(
+        constraints: usize,
+        circuit: &C,
+    ) -> Result<Self, Error>
+    where
+        C: Circuit,
+    {
+        let mut composer = Self::initialized_for_proving(constraints);
+
+        circuit.circuit(&mut composer)?;
+
+        let description_size = composer.constraints();
+        if description_size != constraints {
+            return Err(Error::InvalidCircuitSize(
+                description_size,
+                constraints,
+            ));
+        }
+
+        composer.runtime().event(RuntimeEvent::ProofFinished);
+
+        Ok(composer)
     }
 
     /// Prove a circuit with a composer initialized with dummy gates

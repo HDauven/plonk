@@ -84,11 +84,29 @@ impl Serializable<{ 7 * Commitment::SIZE }> for VerifierKey {
 mod alloc {
     use super::*;
     use crate::proof_system::linearization_poly::ProofEvaluations;
+    #[cfg(test)]
     #[rustfmt::skip]
     use ::alloc::vec::Vec;
-    use dusk_bls12_381::{BlsScalar, G1Affine};
+    use dusk_bls12_381::BlsScalar;
+    #[cfg(test)]
+    use dusk_bls12_381::G1Affine;
 
     impl VerifierKey {
+        pub(crate) fn linearization_scalars(
+            evaluations: &ProofEvaluations,
+        ) -> [BlsScalar; 6] {
+            let q_arith_eval = evaluations.q_arith_eval;
+            [
+                evaluations.a_eval * evaluations.b_eval * q_arith_eval,
+                evaluations.a_eval * q_arith_eval,
+                evaluations.b_eval * q_arith_eval,
+                evaluations.c_eval * q_arith_eval,
+                evaluations.d_eval * q_arith_eval,
+                q_arith_eval,
+            ]
+        }
+
+        #[cfg(test)]
         pub(crate) fn compute_linearization_commitment(
             &self,
             scalars: &mut Vec<BlsScalar>,

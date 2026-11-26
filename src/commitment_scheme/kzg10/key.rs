@@ -411,21 +411,59 @@ impl CommitKey {
         }
 
         let max_len = polynomials.iter().map(|poly| poly.len()).max().unwrap();
-        let mut coefficients = vec![BlsScalar::zero(); max_len];
-        let mut power = BlsScalar::one();
-
-        for (index, polynomial) in polynomials.iter().enumerate() {
-            if index != 0 {
-                power *= v_challenge;
-            }
-            for (coefficient, term) in
-                coefficients.iter_mut().zip(polynomial.iter())
-            {
-                *coefficient += *term * power;
-            }
+        if max_len == 0 {
+            return Polynomial::zero();
         }
 
-        Polynomial::from_coefficients_vec(coefficients).ruffini(*point)
+        let powers = util::powers_of(v_challenge, polynomials.len() - 1);
+        let mut coefficients = vec![BlsScalar::zero(); max_len];
+
+        #[cfg(feature = "std")]
+        {
+            let raw_terms: Vec<(BlsScalar, &[BlsScalar])> = powers
+                .iter()
+                .zip(polynomials.iter())
+                .map(|(&p, poly)| (p, &poly[..]))
+                .collect();
+            const PARALLEL_AGG_MIN_LEN: usize = 1 << 12;
+            const AGG_CHUNK_SIZE: usize = 512;
+            if max_len >= PARALLEL_AGG_MIN_LEN
+                && rayon::current_num_threads() > 1
+            {
+                use rayon::prelude::*;
+
+                coefficients
+                    .par_chunks_mut(AGG_CHUNK_SIZE)
+                    .enumerate()
+                    .for_each(|(chunk_idx, out_chunk)| {
+                        crate::fast_fr::poly_lincomb_chunk_fast(
+                            &raw_terms,
+                            chunk_idx * AGG_CHUNK_SIZE,
+                            out_chunk,
+                        );
+                    });
+            } else {
+                crate::fast_fr::poly_lincomb_chunk_fast(
+                    &raw_terms,
+                    0,
+                    &mut coefficients,
+                );
+            }
+            Polynomial::from_coefficients_vec(coefficients).ruffini(*point)
+        }
+
+        #[cfg(not(feature = "std"))]
+        {
+            for (polynomial, power) in polynomials.iter().zip(&powers) {
+                for (coefficient, term) in
+                    coefficients.iter_mut().zip(polynomial.iter())
+                {
+                    *coefficient += *term * power;
+                }
+            }
+
+            Polynomial::from_coefficients_vec(coefficients).ruffini(*point)
+        }
     }
 }
 
@@ -443,6 +481,12 @@ pub struct OpeningKey {
     pub(crate) prepared_h: G2Prepared,
     /// 'x' times the above generator of G2, prepared for use in pairings.
     pub(crate) prepared_x_h: G2Prepared,
+    /// Precomputed `blst` Miller-loop line coefficients for `h`.
+    #[cfg(feature = "blst-backend")]
+    pub(crate) blst_lines_h: alloc::boxed::Box<[blst::blst_fp6; 68]>,
+    /// Precomputed `blst` Miller-loop line coefficients for `x_h`.
+    #[cfg(feature = "blst-backend")]
+    pub(crate) blst_lines_x_h: alloc::boxed::Box<[blst::blst_fp6; 68]>,
 }
 
 #[cfg(feature = "rkyv-impl")]
@@ -498,6 +542,10 @@ fn decode_archived_opening_key(
         x_h,
         prepared_h,
         prepared_x_h,
+        #[cfg(feature = "blst-backend")]
+        blst_lines_h: crate::blst_backend::precompute_g2_lines(&h),
+        #[cfg(feature = "blst-backend")]
+        blst_lines_x_h: crate::blst_backend::precompute_g2_lines(&x_h),
     })
 }
 
@@ -629,6 +677,19 @@ impl Serializable<{ G1Affine::SIZE + G2Affine::SIZE * 2 }> for OpeningKey {
 }
 
 impl OpeningKey {
+    /// Returns `true` if `self` and `other` share identical SRS opening
+    /// parameters `(g, h, x_h)`.
+    pub(crate) fn matches(&self, other: &Self) -> bool {
+        self.g == other.g && self.h == other.h && self.x_h == other.x_h
+    }
+
+    /// Absorbs `(g, h, x_h)` into a Fiat-Shamir transcript.
+    pub(crate) fn append_to_transcript(&self, transcript: &mut Transcript) {
+        transcript.append_message(b"ok_g", &self.g.to_bytes());
+        transcript.append_message(b"ok_h", &self.h.to_bytes());
+        transcript.append_message(b"ok_x_h", &self.x_h.to_bytes());
+    }
+
     pub(crate) fn try_new(
         g: G1Affine,
         h: G2Affine,
@@ -656,6 +717,10 @@ impl OpeningKey {
             x_h,
             prepared_h,
             prepared_x_h,
+            #[cfg(feature = "blst-backend")]
+            blst_lines_h: crate::blst_backend::precompute_g2_lines(&h),
+            #[cfg(feature = "blst-backend")]
+            blst_lines_x_h: crate::blst_backend::precompute_g2_lines(&x_h),
         })
     }
 

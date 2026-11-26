@@ -37,12 +37,66 @@ mod alloc {
     use crate::proof_system::widget::ecc::scalar_mul::fixed_base::proverkey::{
         check_bit_consistency, extract_bit,
     };
+    #[cfg(test)]
     #[rustfmt::skip]
     use ::alloc::vec::Vec;
-    use dusk_bls12_381::{BlsScalar, G1Affine};
+    use dusk_bls12_381::BlsScalar;
+    #[cfg(test)]
+    use dusk_bls12_381::G1Affine;
     use dusk_jubjub::EDWARDS_D;
 
     impl VerifierKey {
+        pub(crate) fn linearization_scalar(
+            ecc_separation_challenge: &BlsScalar,
+            evaluations: &ProofEvaluations,
+        ) -> BlsScalar {
+            let kappa = ecc_separation_challenge.square();
+            let kappa_sq = kappa.square();
+            let kappa_cu = kappa_sq * kappa;
+
+            let x_beta_poly = evaluations.q_l_eval;
+            let y_beta_eval = evaluations.q_r_eval;
+
+            let acc_x = evaluations.a_eval;
+            let acc_x_w = evaluations.a_w_eval;
+            let acc_y = evaluations.b_eval;
+            let acc_y_w = evaluations.b_w_eval;
+
+            let xy_alpha = evaluations.c_eval;
+
+            let accumulated_bit = evaluations.d_eval;
+            let accumulated_bit_w = evaluations.d_w_eval;
+            let bit = extract_bit(&accumulated_bit, &accumulated_bit_w);
+
+            let bit_consistency = check_bit_consistency(bit);
+
+            let y_alpha = (bit.square() * (y_beta_eval - BlsScalar::one()))
+                + BlsScalar::one();
+
+            let x_alpha = x_beta_poly * bit;
+
+            let xy_consistency =
+                ((bit * evaluations.q_c_eval) - xy_alpha) * kappa;
+
+            let x_3 = acc_x_w;
+            let lhs = x_3 + (x_3 * xy_alpha * acc_x * acc_y * EDWARDS_D);
+            let rhs = (x_alpha * acc_y) + (y_alpha * acc_x);
+            let x_acc_consistency = (lhs - rhs) * kappa_sq;
+
+            let y_3 = acc_y_w;
+            let lhs = y_3 - (y_3 * xy_alpha * acc_x * acc_y * EDWARDS_D);
+            let rhs = (x_alpha * acc_x) + (y_alpha * acc_y);
+            let y_acc_consistency = (lhs - rhs) * kappa_cu;
+
+            let a = bit_consistency
+                + x_acc_consistency
+                + y_acc_consistency
+                + xy_consistency;
+
+            a * ecc_separation_challenge
+        }
+
+        #[cfg(test)]
         pub(crate) fn compute_linearization_commitment(
             &self,
             ecc_separation_challenge: &BlsScalar,

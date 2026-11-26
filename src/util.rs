@@ -81,12 +81,21 @@ pub(crate) fn slow_multiscalar_mul_single_base(
 use core::ops::MulAssign;
 
 pub fn batch_inversion(v: &mut [BlsScalar]) {
+    let mut prod = Vec::with_capacity(v.len());
+    batch_inversion_with_scratch(v, &mut prod);
+}
+
+pub(crate) fn batch_inversion_with_scratch(
+    v: &mut [BlsScalar],
+    prod: &mut Vec<BlsScalar>,
+) {
     // Montgomery’s Trick and Fast Implementation of Masked AES
     // Genelle, Prouff and Quisquater
     // Section 3.2
 
     // First pass: compute [a, ab, abc, ...]
-    let mut prod = Vec::with_capacity(v.len());
+    prod.clear();
+    prod.reserve(v.len());
     let mut tmp = BlsScalar::one();
     for f in v.iter().filter(|f| f != &&BlsScalar::zero()) {
         tmp.mul_assign(f);
@@ -94,7 +103,14 @@ pub fn batch_inversion(v: &mut [BlsScalar]) {
     }
 
     // Invert `tmp`.
-    tmp = tmp.invert().unwrap(); // Guaranteed to be nonzero.
+    #[cfg(feature = "blst-backend")]
+    {
+        tmp = crate::blst_backend::fr_invert_nonzero(&tmp);
+    }
+    #[cfg(not(feature = "blst-backend"))]
+    {
+        tmp = tmp.invert().unwrap(); // Guaranteed to be nonzero.
+    }
 
     // Second pass: iterate backwards to compute inverses
     for (f, s) in v
@@ -104,7 +120,13 @@ pub fn batch_inversion(v: &mut [BlsScalar]) {
         // Ignore normalized elements
         .filter(|f| f != &&BlsScalar::zero())
         // Backwards, skip last element, fill in one for last term.
-        .zip(prod.into_iter().rev().skip(1).chain(Some(BlsScalar::one())))
+        .zip(
+            prod.iter()
+                .rev()
+                .skip(1)
+                .copied()
+                .chain(Some(BlsScalar::one())),
+        )
     {
         // tmp := tmp * f; f := tmp * s = 1/f
         let new_tmp = tmp * *f;

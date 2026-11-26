@@ -8,7 +8,9 @@
 #[cfg(feature = "rkyv-impl")]
 use bytecheck::CheckBytes;
 use dusk_bls12_381::{G1Affine, G1Projective};
-use dusk_bytes::{DeserializableSlice, Serializable};
+#[cfg(any(not(feature = "blst-backend"), test))]
+use dusk_bytes::DeserializableSlice;
+use dusk_bytes::Serializable;
 #[cfg(feature = "rkyv-impl")]
 use rkyv::{
     Archive, Deserialize, Serialize,
@@ -84,8 +86,16 @@ impl Serializable<{ G1Affine::SIZE }> for Commitment {
     }
 
     fn from_bytes(buf: &[u8; Self::SIZE]) -> Result<Self, Self::Error> {
-        let g1 = G1Affine::from_slice(buf)?;
-        Ok(Self(g1))
+        #[cfg(feature = "blst-backend")]
+        {
+            let g1 = crate::blst_backend::decode_g1_compressed(buf)?;
+            Ok(Self(g1))
+        }
+        #[cfg(not(feature = "blst-backend"))]
+        {
+            let g1 = G1Affine::from_slice(buf)?;
+            Ok(Self(g1))
+        }
     }
 }
 

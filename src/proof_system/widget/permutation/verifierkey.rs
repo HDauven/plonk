@@ -37,11 +37,53 @@ mod alloc {
     use super::*;
     use crate::composer::permutation::constants::{K1, K2, K3};
     use crate::proof_system::linearization_poly::ProofEvaluations;
+    #[cfg(test)]
     #[rustfmt::skip]
     use ::alloc::vec::Vec;
-    use dusk_bls12_381::{BlsScalar, G1Affine};
+    use dusk_bls12_381::BlsScalar;
+    #[cfg(test)]
+    use dusk_bls12_381::G1Affine;
 
     impl VerifierKey {
+        pub(crate) fn linearization_scalars(
+            evaluations: &ProofEvaluations,
+            z_challenge: &BlsScalar,
+            u_challenge: &BlsScalar,
+            (alpha, beta, gamma): (&BlsScalar, &BlsScalar, &BlsScalar),
+            l1_eval: &BlsScalar,
+        ) -> (BlsScalar, BlsScalar) {
+            let alpha_sq = alpha.square();
+
+            let x = {
+                let beta_z = beta * z_challenge;
+                let q_0 = evaluations.a_eval + beta_z + gamma;
+                let q_1 = evaluations.b_eval + beta_z * K1 + gamma;
+                let q_2 = evaluations.c_eval + beta_z * K2 + gamma;
+                let q_3 = (evaluations.d_eval + beta_z * K3 + gamma) * alpha;
+                q_0 * q_1 * q_2 * q_3
+            };
+
+            let r = l1_eval * alpha_sq;
+            let z_scalar = x + r + u_challenge;
+
+            let y = {
+                let q_0 = evaluations.a_eval
+                    + beta * evaluations.s_sigma_1_eval
+                    + gamma;
+                let q_1 = evaluations.b_eval
+                    + beta * evaluations.s_sigma_2_eval
+                    + gamma;
+                let q_2 = evaluations.c_eval
+                    + beta * evaluations.s_sigma_3_eval
+                    + gamma;
+                let q_3 = beta * evaluations.z_eval * alpha;
+                -(q_0 * q_1 * q_2 * q_3)
+            };
+
+            (z_scalar, y)
+        }
+
+        #[cfg(test)]
         pub(crate) fn compute_linearization_commitment(
             &self,
             scalars: &mut Vec<BlsScalar>,

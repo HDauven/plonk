@@ -4,6 +4,8 @@
 //
 // Copyright (c) DUSK NETWORK. All rights reserved.
 
+#![cfg_attr(feature = "std", allow(dead_code))]
+
 #[cfg(feature = "rkyv-impl")]
 use bytecheck::CheckBytes;
 use dusk_bls12_381::BlsScalar;
@@ -14,6 +16,7 @@ use rkyv::{
 };
 
 use crate::fft::{Evaluations, Polynomial};
+#[cfg(test)]
 use crate::proof_system::linearization_poly::ProofEvaluations;
 
 #[derive(Debug, Eq, PartialEq, Clone)]
@@ -49,13 +52,16 @@ impl ProverKey {
         c_i: &BlsScalar,
         d_i: &BlsScalar,
     ) -> BlsScalar {
+        let q_arith_i = &self.q_arith.1[index];
+        if *q_arith_i == BlsScalar::zero() {
+            return BlsScalar::zero();
+        }
         let q_m_i = &self.q_m.1[index];
         let q_l_i = &self.q_l.1[index];
         let q_r_i = &self.q_r.1[index];
         let q_o_i = &self.q_o.1[index];
         let q_f_i = &self.q_f.1[index];
         let q_c_i = &self.q_c.1[index];
-        let q_arith_i = &self.q_arith.1[index];
 
         // (a(x)b(x)q_M(x) + a(x)q_L(x) + b(X)q_R(x) + c(X)q_O(X) + d(x)q_F(X) +
         // q_C(X)) * q_arith(X)
@@ -69,6 +75,7 @@ impl ProverKey {
         (a_1 + a_2 + a_3 + a_4 + a_5 + a_6) * q_arith_i
     }
 
+    #[cfg(test)]
     pub(crate) fn compute_linearization(
         &self,
         evaluations: &ProofEvaluations,
@@ -80,23 +87,11 @@ impl ProverKey {
         let q_f_poly = &self.q_f.0;
         let q_c_poly = &self.q_c.0;
 
-        // (a_eval * b_eval * q_m_poly + a_eval * q_l + b_eval * q_r + c_eval
-        // * q_o + d_eval * q_f + q_c) * q_arith_eval
-        //
-        // a_eval * b_eval * q_m_poly
         let ab = evaluations.a_eval * evaluations.b_eval;
         let a_0 = q_m_poly * &ab;
-
-        // a_eval * q_l
         let a_1 = q_l_poly * &evaluations.a_eval;
-
-        // b_eval * q_r
         let a_2 = q_r_poly * &evaluations.b_eval;
-
-        //c_eval * q_o
         let a_3 = q_o_poly * &evaluations.c_eval;
-
-        // d_eval * q_f
         let a_4 = q_f_poly * &evaluations.d_eval;
 
         let mut a = &a_0 + &a_1;
@@ -105,7 +100,6 @@ impl ProverKey {
         a = &a + &a_4;
         a = &a + q_c_poly;
         a = &a * &evaluations.q_arith_eval;
-
         a
     }
 }

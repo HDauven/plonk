@@ -17,7 +17,7 @@ pub use crate::proof_system::Proof;
 #[cfg(feature = "alloc")]
 pub use crate::{
     commitment_scheme::PublicParameters,
-    compiler::{Compiler, PlonkVersion, Prover, Verifier},
+    compiler::{BatchVerifier, Compiler, PlonkVersion, Prover, Verifier},
     composer::{
         Circuit, Composer, Constraint, TorsionFreeWitnessPoint, Witness,
         WitnessPoint,

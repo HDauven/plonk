@@ -584,7 +584,7 @@ impl<const ENABLED: bool> Circuit for IsolatedCurveAdditionCircuit<ENABLED> {
             }
         }
 
-        if !ENABLED {
+        if !ENABLED && !composer.proving_only {
             // The debugger retains the row as appended, so its diagnostic can
             // show the stale active selector even though the circuit clears it.
             let selector =

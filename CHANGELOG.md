@@ -9,12 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Optimize linearization, permutation vector construction, and opening rounds in `Prover::prove` [#1030]
+- Fuse quotient polynomial evaluation and hoist widget challenges in `Prover::prove` [#1029]
+- Optimize FFT transforms and polynomial evaluation in `Prover::prove` [#1028]
 - Replace `PublicParameters::from_slice_unchecked` with the checked, fallible `PublicParameters::from_raw_var_bytes` [#1021]
 - Reject raw commitment-key points with flag bytes above 1 in
   `Prover::try_from_bytes` [#1021]
 - Validate large raw commitment keys in parallel in `Prover::try_from_bytes`
   when `std` is enabled [#1021]
 - Parallelize construction of the verifier pairing inputs with Rayon when `std` is enabled, retaining the serial `no_std` path [#1001]
+
+### Fixed
+
+- Fix `Prover::prove` failing to produce a valid proof for four-row circuits when the linear and quadratic permutation blinders are zero and the constant blinder is nonzero [#1030]
 
 ## [0.24.0] - 2026-10-08
 
@@ -848,6 +855,9 @@ is necessary since `rkyv/validation` was required as a bound.
 - Proof system module.
 
 <!-- ISSUES -->
+[#1030]: https://github.com/dusk-network/plonk/issues/1030
+[#1029]: https://github.com/dusk-network/plonk/issues/1029
+[#1028]: https://github.com/dusk-network/plonk/issues/1028
 [#1021]: https://github.com/dusk-network/plonk/issues/1021
 [#1011]: https://github.com/dusk-network/plonk/issues/1011
 [#1006]: https://github.com/dusk-network/plonk/issues/1006
