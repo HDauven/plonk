@@ -25,6 +25,7 @@ Details of the underlying protocol are available in the [PLONK specification](do
 - **Prover arithmetic & FFTs**: Radix-4 DIT FFT with block parallelism, fused 8-coset quotient polynomial evaluation (`FastFr` with `x86_64` `mulx`/`adcx`/`adox` assembly + portable fallback), fused linearization, parallel permutation vector construction, and batched JubJub inversions in `Composer`.
 - **Lagrange-basis wire commitments**: Precomputed Lagrange SRS (`g1_ifft_blst`) skips zero witness entries, folds small `±1..=±15` scalars via direct additions, and runs narrow 16/64-bit Pippenger passes for small-integer witnesses.
 - **Batched-Affine Pippenger MSM**: L2-resident `96 B/bucket` affine Pippenger over `blst_fp` assembly using Montgomery batch inversion (`1` inversion per up to `256` additions), narrow-top-window XYZZ dispatch, and skewed-bucket Jacobian overflow protection — up to **1.46× faster than `blst`'s XYZZ Pippenger** at `2^16`.
+- **Optional Native CUDA GPU Backend (`gpu-cuda`)**: Zero-dependency (`dlopen("libcuda.so.1")` + embedded `.version 7.5 / sm_70` PTX — no `nvcc`, no `cmake`, no license server) GPU acceleration supporting Volta through Blackwell (SM 12.0). Features 100% register-resident BLS12-381 `Fp`/XYZZ Pippenger MSM with adaptive load-balanced sub-bucket chunking and 64-thread parallel tree reduction, fused 8-stage shared-memory + global radix-2 `Fr` coset NTT/IFFT, reusable page-locked (`cuMemAllocHost_v2`) DMA buffers, and automatic fallback to CPU when no CUDA GPU is present.
 - **Verification & Batch Verification**:
   - Parallel `Proof::from_bytes` G1 decompression via `blst` (**4.2× faster**).
   - Precomputed 4-tooth × 2-group × 8-point variable-time Comb table for static verifier commitments (`192 KiB`) + 128-bit BLS12-381 GLV Straus (`w = 5`) for dynamic commitments + pipelined `ml1` Miller loop overlapped with the right MSM.
@@ -32,27 +33,30 @@ Details of the underlying protocol are available in the [PLONK specification](do
 
 ## Performance
 
-Measured on an **Intel Core Ultra 9 275HX** (22 cores, `--profile bench`, `BenchmarkCircuit` with 32 public inputs). See [BENCHMARKS.md](https://github.com/HDauven/plonk/blob/fast-plonk/BENCHMARKS.md) for the full methodology, stage breakdown, and reproduction commands.
+Measured on an **Intel Core Ultra 9 275HX** (22 cores) + **NVIDIA GeForce RTX 5070 Ti Laptop GPU** (Blackwell SM 12.0, 12 GB VRAM, `--profile bench`, `BenchmarkCircuit` with 32 public inputs). See [BENCHMARKS.md](https://github.com/HDauven/plonk/blob/gpu-cuda/BENCHMARKS.md) for the full methodology, stage breakdown, and reproduction commands.
 
-| Operation | Upstream `master` | `fast-plonk` | Speedup |
-|---|---:|---:|---:|
-| **Prove `2^12` (4,096 gates)** | `161.5 ms` | **`44.4 ms`** *(min `42.4 ms`)* | **3.6×** |
-| **Prove `2^13` (8,192 gates)** | `326.1 ms` | **`72.9 ms`** *(min `67.7 ms`)* | **4.5×** |
-| **Prove `2^14` (16,384 gates)** | `647.6 ms` | **`120.1 ms`** *(min `119.2 ms`)* | **5.4×** |
-| **Prove `2^15` (32,768 gates)** | `1,074.7 ms` | **`231.4 ms`** *(min `219.7 ms`)* | **4.6×** |
-| **Prove `2^16` (65,536 gates)** | `2,073.6 ms` | **`441.0 ms`** *(min `418.9 ms`)* | **4.7×** |
-| **`Proof::from_bytes`** | `~870 µs` | **`208 µs`** | **4.2×** |
-| **Verify single (32 PI)** | `~2,550 µs` | **`942 µs`** *(~800 µs quiet)* | **2.7× – 3.2×** |
-| **Verify batch 16 (32 PI)** | `~40.8 ms` *(16× single)* | **`2.34 ms`** (`146 µs/proof`) | **17.4×** |
-| **Verify batch 32 (32 PI)** | `~81.6 ms` *(32× single)* | **`2.86 ms`** (`89 µs/proof`) | **28.6×** |
-| **Verify batch 64 (32 PI)** | `~163.2 ms` *(64× single)* | **`4.01 ms`** (`63 µs/proof`) | **40.7×** |
+| Operation | Upstream `master` | `fast-plonk` (CPU) | `fast-plonk` (`gpu-cuda`) | Speedup vs `master` |
+|---|---:|---:|---:|---:|
+| **Prove `2^12` (4,096 gates)** | `161.5 ms` | `44.4 ms` *(min `42.4 ms`)* | **`33.7 ms`** *(min `32.0 ms`)* | **4.8×** |
+| **Prove `2^13` (8,192 gates)** | `326.1 ms` | `72.9 ms` *(min `67.7 ms`)* | **`42.2 ms`** *(min `40.6 ms`)* | **7.7×** |
+| **Prove `2^14` (16,384 gates)** | `647.6 ms` | `120.1 ms` *(min `119.2 ms`)* | **`65.5 ms`** *(min `62.5 ms`)* | **9.9×** |
+| **Prove `2^15` (32,768 gates)** | `1,074.7 ms` | `231.4 ms` *(min `219.7 ms`)* | **`124.6 ms`** *(min `119.9 ms`)* | **8.6×** |
+| **Prove `2^16` (65,536 gates)** | `2,073.6 ms` | `441.0 ms` *(min `418.9 ms`)* | **`226.1 ms`** *(min `223.1 ms`)* | **9.2×** |
+| **`Proof::from_bytes`** | `~870 µs` | **`208 µs`** | **`207 µs`** | **4.2×** |
+| **Verify single (32 PI)** | `~2,550 µs` | **`942 µs`** *(~800 µs quiet)* | **`837 µs`** | **3.0×** |
+| **Verify batch 16 (32 PI)** | `~40.8 ms` *(16× single)* | **`2.34 ms`** (`146 µs/proof`) | **`2.34 ms`** | **17.4×** |
+| **Verify batch 32 (32 PI)** | `~81.6 ms` *(32× single)* | **`2.86 ms`** (`89 µs/proof`) | **`2.86 ms`** | **28.6×** |
+| **Verify batch 64 (32 PI)** | `~163.2 ms` *(64× single)* | **`4.01 ms`** (`63 µs/proof`) | **`4.01 ms`** | **40.7×** |
 
 Run the end-to-end profiler yourself:
 
 ```bash
+# CPU (default: std + blst-backend)
 cargo run --profile bench --example profile_plonk
+# CUDA GPU (opt-in, zero nvcc/cmake required — only NVIDIA driver libcuda.so.1)
+cargo run --profile bench --features gpu-cuda --example profile_plonk
 # Optional per-stage prover breakdown:
-PLONK_STAGE_PROFILE=1 cargo run --profile bench --example profile_plonk
+PLONK_STAGE_PROFILE=1 cargo run --profile bench --features gpu-cuda --example profile_plonk
 ```
 
 ## Usage
@@ -63,6 +67,7 @@ Check the [examples directory](https://github.com/HDauven/plonk/tree/fast-plonk/
 
 - `default = ["std", "blst-backend"]`: Enables `std`, `rayon` parallelism, and the `blst` assembly backend.
 - `blst-backend`: Enables `blst`-accelerated G1 MSMs (including Batched-Affine Pippenger), Lagrange SRS IFFT, compressed G1 decoding, precomputed G2 Miller-loop pairings, and `Fr` Euclidean inversion. Disable with `--no-default-features --features std` for a 100% pure-Rust multi-threaded build.
+- `gpu-cuda`: Opt-in native CUDA Driver API + embedded PTX GPU acceleration for BLS12-381 G1 MSMs (`size >= 4096`) and batched 8-coset `Fr` NTT/IFFTs (`size >= 8192`). Dynamically loads `libcuda.so.1` at runtime with zero `nvcc`/`cmake`/license dependencies and falls back automatically to CPU when no CUDA GPU is available. Select a specific GPU via `PLONK_CUDA_DEVICE=<index>`.
 - `std`: Enables `std` usage and `rayon` parallelization across proving and verification.
 - `alloc`: Enables allocator support for `no_std` proving and verification (`--no-default-features --features alloc`). Without `alloc`, the crate still exports fixed-size types such as `Proof`.
 - `rkyv-impl`: Enables zero-copy `rkyv` serialization/validation.

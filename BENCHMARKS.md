@@ -5,42 +5,45 @@ All measurements below compare upstream `dusk-network/plonk` `master` (`750d38d`
 ## Test Environment
 
 - **CPU**: Intel Core Ultra 9 275HX (22 cores: 8 P-cores + 14 E-cores, x86_64 with ADX + BMI2)
+- **GPU**: NVIDIA GeForce RTX 5070 Ti Laptop GPU (Blackwell SM 12.0, 12 GB GDDR7, Driver `591.86`, optional `--features gpu-cuda`)
 - **Profile**: `--profile bench` (`opt-level = 3`, `lto = true`, `codegen-units = 1`, `debug = false`)
 - **Circuit**: `BenchmarkCircuit` (JubJub scalar multiplication + arithmetic/range/logic gates, 32 public inputs, sizes `2^12` through `2^16`)
 - **Command**:
   ```bash
   cargo run --profile bench --example profile_plonk
+  # With native CUDA GPU backend:
+  cargo run --profile bench --features gpu-cuda --example profile_plonk
   # With per-stage prover breakdown:
-  PLONK_STAGE_PROFILE=1 cargo run --profile bench --example profile_plonk
+  PLONK_STAGE_PROFILE=1 cargo run --profile bench --features gpu-cuda --example profile_plonk
   ```
 
 ---
 
 ## 1. End-to-End Proving Latency
 
-| Circuit Size | Gates | `master` (`750d38d`) | Phase 1 (`blst` XYZZ) | Phase 2 (`fast-plonk`, Batched-Affine) | Speedup vs `master` |
-|---|---:|---:|---:|---:|---:|
-| `2^12` | 4,096 | `161.53 ms` | `50.58 ms` | **`44.36 ms`** *(min `41.24 ms`)* | **3.64×** *(3.92× min)* |
-| `2^13` | 8,192 | `326.13 ms` | `76.31 ms` | **`72.90 ms`** *(min `67.66 ms`)* | **4.47×** *(4.82× min)* |
-| `2^14` | 16,384 | `647.60 ms` | `144.16 ms` | **`120.12 ms`** *(min `119.22 ms`)* | **5.39×** *(5.43× min)* |
-| `2^15` | 32,768 | `1,074.70 ms` | `253.42 ms` | **`231.37 ms`** *(min `218.48 ms`)* | **4.64×** *(4.92× min)* |
-| `2^16` | 65,536 | `2,073.60 ms` | `476.86 ms` | **`440.97 ms`** *(min `418.90 ms`)* | **4.70×** *(4.95× min)* |
+| Circuit Size | Gates | `master` (`750d38d`) | Phase 1 (`blst` XYZZ) | Phase 2 (CPU Batched-Affine) | Phase 3 (`gpu-cuda`, RTX 5070 Ti) | GPU Speedup vs `master` |
+|---|---:|---:|---:|---:|---:|---:|
+| `2^12` | 4,096 | `161.53 ms` | `50.58 ms` | `44.36 ms` *(min `41.24 ms`)* | **`33.69 ms`** *(min `32.04 ms`)* | **4.79×** *(5.04× min)* |
+| `2^13` | 8,192 | `326.13 ms` | `76.31 ms` | `72.90 ms` *(min `67.66 ms`)* | **`42.20 ms`** *(min `40.60 ms`)* | **7.73×** *(8.03× min)* |
+| `2^14` | 16,384 | `647.60 ms` | `144.16 ms` | `120.12 ms` *(min `119.22 ms`)* | **`65.53 ms`** *(min `62.46 ms`)* | **9.88×** *(10.37× min)* |
+| `2^15` | 32,768 | `1,074.70 ms` | `253.42 ms` | `231.37 ms` *(min `218.48 ms`)* | **`124.56 ms`** *(min `119.93 ms`)* | **8.63×** *(8.96× min)* |
+| `2^16` | 65,536 | `2,073.60 ms` | `476.86 ms` | `440.97 ms` *(min `418.90 ms`)* | **`226.14 ms`** *(min `223.07 ms`)* | **9.17×** *(9.30× min)* |
 
 ### Stage-by-Stage Prover Breakdown at `2^16` (65,536 gates)
 
-Captured via `PLONK_STAGE_PROFILE=1` (typical clean run ~`432 ms`):
+Captured via `PLONK_STAGE_PROFILE=1`:
 
-| Stage | Time | Share | Primary Acceleration |
-|---|---:|---:|---|
-| `composer` | `12.3 ms` | 2.9% | Batched JubJub inversions (`504→1`, `256→1`), cached generator multiples, zero/unit selector fast paths |
-| `wire_ifft` | `11.3 ms` | 2.6% | Radix-4 DIT IFFT with block parallelism |
-| `wire_msm` | `19.7 ms` | 4.6% | Precomputed Lagrange SRS (`g1_ifft_blst`), zero skipping, `±1..=±15` direct folding, 16/64-bit buckets, skewed-bucket Jacobian overflow |
-| `perm + z_ifft` | `13.9 ms` | 3.2% | Parallel prefix-product permutation vector + `blst_fr_eucl_inverse` batch inversion |
-| `z_msm` | `39.5 ms` | 9.2% | Batched-Affine Pippenger (`w = 13`) |
-| `quot` (8-coset) | `121.2 ms` | 28.1% | Fused 8-coset `FastFr` engine (`x86_64` `mulx`/`adcx`/`adox` assembly) |
-| `quot_msm` (4×) | `126.7 ms` | 29.3% | Batched-Affine Pippenger (`w = 13`, 4 polynomials tiled flat across Rayon) |
-| `r4 + r5` (2× MSM + lin) | `84.4 ms` | 19.5% | Fused linearization + Horner evaluation + Batched-Affine Pippenger |
-| **Total** | **`~432 ms`** | **100%** | **4.8× vs `master` (`2,074 ms`)** |
+| Stage | CPU `fast-plonk` (~`432 ms`) | GPU `gpu-cuda` (~`210 ms` quiet) | GPU vs CPU | Primary GPU Acceleration |
+|---|---:|---:|---:|---|
+| `composer` | `12.3 ms` | `12.1 ms` | `1.0×` | CPU batched JubJub inversions & zero/unit selector fast paths |
+| `wire_ifft` | `11.3 ms` | `11.7 ms` | `1.0×` | CPU radix-4 DIT IFFT |
+| `wire_msm` (4×) | `19.7 ms` | **`18.7 ms`** | `1.1×` | GPU Pippenger (`w = 13`, skips 3.25 s CPU Lagrange G1 IFFT!) |
+| `perm + z_ifft` | `13.9 ms` | `16.4 ms` | `0.85×` | CPU parallel prefix-product + `blst_fr_eucl_inverse` |
+| `z_msm` (1×) | `39.5 ms` | **`7.7 ms`** | **5.1×** | Register-resident GPU XYZZ Pippenger (`2.9 ms` kernel compute) |
+| `quot` (8-coset) | `121.2 ms` | **`99.6 ms`** | **1.22×** | Fused 8-stage shared-mem + global radix-2 GPU `Fr` NTT/IFFT over pinned DMA + CPU pointwise |
+| `quot_msm` (4×) | `126.7 ms` | **`18.9 ms`** | **6.7×** | Batched 4× GPU Pippenger (`w = 13`, adaptive sub-bucket chunking + 64-thread tree reduce) |
+| `r4 + r5` (2× MSM + lin) | `84.4 ms` | **`23.7 ms`** | **3.6×** | CPU fused linearization/Horner + batched 2× GPU Pippenger |
+| **Total** | **`~432 ms`** | **`~210–226 ms`** | **~2.0×** | **9.2×–9.9× vs `master` (`2,074 ms`)** |
 
 ---
 
