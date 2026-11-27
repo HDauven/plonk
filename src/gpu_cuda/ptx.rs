@@ -3022,14 +3022,386 @@ fn emit_quotient_eval_kernel(out: &mut String) {
     );
 }
 
+/// Emit `g1_decompress_and_subgroup_check`:
+/// Parallel BLS12-381 compressed G1 decoding (48-byte big-endian Zcash format)
+/// with canonicality check (`x < p`), square root `y = (x^3 + 4)^((p+1)/4)`,
+/// lexicographic sign selection, and exact prime-order G1 subgroup verification
+/// `[z^2]P == -phi(P)` (`|z| = 0xd201000000010000`), outputting 96-byte
+/// `blst_p1_affine` Montgomery limbs and a `u8` status (`0 = ok`, `1 = invalid`).
+fn emit_g1_decompress_kernel(out: &mut String) {
+    const FP_FOUR_MONT: [u64; 6] = [
+        0xaa27_0000_000c_fff3,
+        0x53cc_0032_fc34_000a,
+        0x478f_e97a_6b0a_807f,
+        0xb1d3_7ebe_e6ba_24d7,
+        0x8ec9_733b_bf78_ab2f,
+        0x09d6_4551_3d83_de7e,
+    ];
+    const FP_R2_MONT: [u64; 6] = [
+        0xf4df_1f34_1c34_1746,
+        0x0a76_e6a6_09d1_04f1,
+        0x8de5_476c_4c95_b6d5,
+        0x67eb_88a9_939d_83c0,
+        0x9a79_3e85_b519_952d,
+        0x1198_8fe5_92ca_e3aa,
+    ];
+    const FP_HALF_P: [u64; 6] = [
+        0xdcff_7fff_ffff_d555,
+        0x0f55_ffff_58a9_ffff,
+        0xb398_6950_7b58_7b12,
+        0xb23b_a5c2_79c2_895f,
+        0x258d_d3db_21a5_d66b,
+        0x0d00_88f5_1cbf_f34d,
+    ];
+    let p = FP_P;
+
+    let _ = writeln!(
+        out,
+        r#"
+.visible .entry g1_decompress_and_subgroup_check(
+    .param .u64 p_in,
+    .param .u64 p_params,
+    .param .u64 p_out,
+    .param .u64 p_status,
+    .param .u32 p_count
+)
+{{
+    .reg .u32 %tid_g, %r_ctaid, %r_ntid, %count, %u_lo, %u_hi, %flags, %sort_bit;
+    .reg .u32 %wi, %bit, %li, %sh, %dig, %tmp32;
+    .reg .u64 %in_p, %prm_p, %out_p, %st_p, %off, %addr, %wtmp, %ebits, %zabs;
+    .reg .u64 %px<6>, %py<6>, %ax<6>, %ay<6>, %azz<6>, %azzz<6>;
+    .reg .u64 %bx<6>, %by<6>, %qx<6>, %qy<6>, %qzz<6>, %qzzz<6>;
+    .reg .u64 %ta<6>, %tb<6>, %tc<6>, %td<6>, %te<6>;
+    .reg .pred %oob, %pz0, %pz1, %p_inf, %p_comp, %p_lex, %p_sort, %p_flip, %p_loop, %p_d1, %p_d2, %p_d3, %p_add;"#
+    );
+    emit_fp_scratch_decls(out);
+    let _ = writeln!(
+        out,
+        r#"
+    mov.u32 %r_ctaid, %ctaid.x;
+    mov.u32 %r_ntid, %ntid.x;
+    mov.u32 %tid_g, %tid.x;
+    mad.lo.u32 %tid_g, %r_ctaid, %r_ntid, %tid_g;
+
+    ld.param.u32 %count, [p_count];
+    setp.ge.u32 %oob, %tid_g, %count;
+    @%oob ret;
+
+    ld.param.u64 %in_p, [p_in];
+    ld.param.u64 %prm_p, [p_params];
+    ld.param.u64 %out_p, [p_out];
+    ld.param.u64 %st_p, [p_status];
+
+    // 1. Load 48 big-endian bytes into little-endian limbs px0..px5.
+    mul.wide.u32 %off, %tid_g, 48;
+    add.u64 %addr, %in_p, %off;"#
+    );
+    for i in 0..6usize {
+        let byte_off = (5 - i) * 8;
+        let _ = writeln!(
+            out,
+            "    ld.global.u64 %wtmp, [%addr + {byte_off}];\n    \
+             mov.b64 {{%u_lo, %u_hi}}, %wtmp;\n    \
+             prmt.b32 %u_lo, %u_lo, 0, 0x0123;\n    \
+             prmt.b32 %u_hi, %u_hi, 0, 0x0123;\n    \
+             mov.b64 %px{i}, {{%u_hi, %u_lo}};"
+        );
+    }
+    let _ = writeln!(
+        out,
+        r#"
+    // Extract top 3 flag bits from px5: bit2=comp(0x80), bit1=inf(0x40), bit0=sort(0x20).
+    shr.u64 %wtmp, %px5, 61;
+    cvt.u32.u64 %flags, %wtmp;
+    and.b64 %px5, %px5, 0x1fffffffffffffff;
+
+    // Compression bit must be set.
+    and.b32 %tmp32, %flags, 4;
+    setp.eq.u32 %p_comp, %tmp32, 0;
+    @%p_comp bra L_DEC_INVALID;
+
+    // Check infinity flag.
+    and.b32 %tmp32, %flags, 2;
+    setp.ne.u32 %p_inf, %tmp32, 0;
+    @!%p_inf bra L_DEC_FINITE;
+
+    // Infinity requires sort bit == 0 and all 381 payload bits == 0.
+    and.b32 %tmp32, %flags, 1;
+    setp.ne.u32 %pz0, %tmp32, 0;
+    @%pz0 bra L_DEC_INVALID;"#
+    );
+    emit_fp_is_zero(out, "pz0", "px");
+    let _ = writeln!(
+        out,
+        "    @!%pz0 bra L_DEC_INVALID;\n    \
+         mul.wide.u32 %off, %tid_g, 96;\n    \
+         add.u64 %addr, %out_p, %off;"
+    );
+    emit_fp_set_zero(out, "px");
+    emit_fp_store(out, "global", "addr", 0, "px");
+    emit_fp_store(out, "global", "addr", 48, "px");
+    let _ = writeln!(
+        out,
+        "    cvt.u64.u32 %off, %tid_g;\n    \
+         add.u64 %addr, %st_p, %off;\n    \
+         st.global.u8 [%addr], 0;\n    \
+         ret;\n\nL_DEC_FINITE:\n    \
+         and.b32 %sort_bit, %flags, 1;"
+    );
+
+    // Canonical check: px < p (must borrow when computing px - p).
+    let _ = writeln!(
+        out,
+        "    mov.u64 %mz0, 0;\n    \
+         sub.cc.u64  %mt0, %px0, 0x{:016x};\n    \
+         subc.cc.u64 %mt1, %px1, 0x{:016x};\n    \
+         subc.cc.u64 %mt2, %px2, 0x{:016x};\n    \
+         subc.cc.u64 %mt3, %px3, 0x{:016x};\n    \
+         subc.cc.u64 %mt4, %px4, 0x{:016x};\n    \
+         subc.cc.u64 %mt5, %px5, 0x{:016x};\n    \
+         subc.u64    %mborrow, %mz0, %mz0;\n    \
+         setp.eq.u64 %pz0, %mborrow, 0;\n    \
+         @%pz0 bra L_DEC_INVALID;",
+        p[0], p[1], p[2], p[3], p[4], p[5]
+    );
+
+    // 2. Convert x to Montgomery form and compute rhs = x^3 + 4 in tc.
+    for (i, &limb) in FP_R2_MONT.iter().enumerate() {
+        let _ = writeln!(out, "    mov.u64 %ta{i}, 0x{limb:016x};");
+    }
+    emit_fp_mul_call(out, "px", "px", "ta");
+    emit_fp_mul_call(out, "ta", "px", "px");
+    emit_fp_mul_call(out, "ta", "ta", "px");
+    for (i, &limb) in FP_FOUR_MONT.iter().enumerate() {
+        let _ = writeln!(out, "    mov.u64 %tb{i}, 0x{limb:016x};");
+    }
+    emit_fp_add(out, "tc", "ta", "tb");
+
+    // 3. Compute y = rhs^((p + 1) / 4) via 2-bit register window (tc=rhs, td=rhs^2, te=rhs^3).
+    emit_fp_mul_call(out, "td", "tc", "tc");
+    emit_fp_mul_call(out, "te", "td", "tc");
+    emit_fp_set_one(out, "py");
+    let _ = writeln!(
+        out,
+        r#"
+    mov.u32 %wi, 190;
+L_DEC_SQRT:
+    setp.eq.u32 %p_loop, %wi, 0;
+    @%p_loop bra L_DEC_SQRT_CHK;
+    sub.u32 %wi, %wi, 1;"#
+    );
+    emit_fp_mul_call(out, "py", "py", "py");
+    emit_fp_mul_call(out, "py", "py", "py");
+    let _ = writeln!(
+        out,
+        r#"    shl.b32 %bit, %wi, 1;
+    shr.u32 %li, %bit, 6;
+    and.b32 %sh, %bit, 63;
+    mul.wide.u32 %off, %li, 8;
+    add.u64 %addr, %prm_p, %off;
+    ld.global.u64 %ebits, [%addr];
+    shr.u64 %ebits, %ebits, %sh;
+    cvt.u32.u64 %dig, %ebits;
+    and.b32 %dig, %dig, 3;
+    setp.eq.u32 %p_d1, %dig, 1;
+    @!%p_d1 bra L_DEC_D2;"#
+    );
+    emit_fp_mul_call(out, "py", "py", "tc");
+    let _ = writeln!(
+        out,
+        "    bra L_DEC_SQRT;\nL_DEC_D2:\n    \
+         setp.eq.u32 %p_d2, %dig, 2;\n    \
+         @!%p_d2 bra L_DEC_D3;"
+    );
+    emit_fp_mul_call(out, "py", "py", "td");
+    let _ = writeln!(
+        out,
+        "    bra L_DEC_SQRT;\nL_DEC_D3:\n    \
+         setp.eq.u32 %p_d3, %dig, 3;\n    \
+         @!%p_d3 bra L_DEC_SQRT;"
+    );
+    emit_fp_mul_call(out, "py", "py", "te");
+    let _ = writeln!(out, "    bra L_DEC_SQRT;\n\nL_DEC_SQRT_CHK:");
+
+    // 4. Verify y^2 == rhs.
+    emit_fp_mul_call(out, "ta", "py", "py");
+    let _ = writeln!(
+        out,
+        "    xor.b64 %mt0, %ta0, %tc0;\n    \
+         xor.b64 %mt1, %ta1, %tc1;\n    \
+         xor.b64 %mt2, %ta2, %tc2;\n    \
+         xor.b64 %mt3, %ta3, %tc3;\n    \
+         xor.b64 %mt4, %ta4, %tc4;\n    \
+         xor.b64 %mt5, %ta5, %tc5;\n    \
+         or.b64 %mt0, %mt0, %mt1;\n    \
+         or.b64 %mt2, %mt2, %mt3;\n    \
+         or.b64 %mt4, %mt4, %mt5;\n    \
+         or.b64 %mt0, %mt0, %mt2;\n    \
+         or.b64 %mt0, %mt0, %mt4;\n    \
+         setp.ne.u64 %pz0, %mt0, 0;\n    \
+         @%pz0 bra L_DEC_INVALID;"
+    );
+
+    // 5. Lexicographic sign check: convert y to canonical via fp_mul(py, 1),
+    // compare against (p - 1) / 2, and negate py if (lex_larger != sort_bit).
+    let _ = writeln!(
+        out,
+        "    mov.u64 %tb0, 1;\n    \
+         mov.u64 %tb1, 0;\n    \
+         mov.u64 %tb2, 0;\n    \
+         mov.u64 %tb3, 0;\n    \
+         mov.u64 %tb4, 0;\n    \
+         mov.u64 %tb5, 0;"
+    );
+    emit_fp_mul_call(out, "ta", "py", "tb");
+    for (i, &limb) in FP_HALF_P.iter().enumerate() {
+        let _ = writeln!(out, "    mov.u64 %tb{i}, 0x{limb:016x};");
+    }
+    let _ = writeln!(
+        out,
+        "    mov.u64 %mz0, 0;\n    \
+         sub.cc.u64  %mt0, %tb0, %ta0;\n    \
+         subc.cc.u64 %mt1, %tb1, %ta1;\n    \
+         subc.cc.u64 %mt2, %tb2, %ta2;\n    \
+         subc.cc.u64 %mt3, %tb3, %ta3;\n    \
+         subc.cc.u64 %mt4, %tb4, %ta4;\n    \
+         subc.cc.u64 %mt5, %tb5, %ta5;\n    \
+         subc.u64    %mborrow, %mz0, %mz0;\n    \
+         setp.ne.u64 %p_lex, %mborrow, 0;\n    \
+         setp.ne.u32 %p_sort, %sort_bit, 0;\n    \
+         xor.pred %p_flip, %p_lex, %p_sort;\n    \
+         @!%p_flip bra L_DEC_SG;"
+    );
+    emit_fp_neg(out, "py", "py");
+
+    // 6. Subgroup check: [z^2]P == -phi(P) = (beta * px, -py),
+    // where |z| = 0xd201000000010000 (bit 63 set, 63 doublings + 5 adds twice).
+    let _ = writeln!(out, "\nL_DEC_SG:");
+    emit_fp_copy(out, "ax", "px");
+    emit_fp_copy(out, "ay", "py");
+    emit_fp_set_one(out, "azz");
+    emit_fp_set_one(out, "azzz");
+    let _ = writeln!(
+        out,
+        r#"    mov.u64 %zabs, 0xd201000000010000;
+    mov.u32 %bit, 63;
+L_DEC_SG1:
+    setp.eq.u32 %p_loop, %bit, 0;
+    @%p_loop bra L_DEC_SG2_INIT;
+    sub.u32 %bit, %bit, 1;"#
+    );
+    emit_xyzz_dbl_inline(out, "SG1_DBL", "ax", "ay", "azz", "azzz", true);
+    let _ = writeln!(
+        out,
+        "    shr.u64 %wtmp, %zabs, %bit;\n    \
+         and.b64 %wtmp, %wtmp, 1;\n    \
+         setp.ne.u64 %p_add, %wtmp, 0;\n    \
+         @!%p_add bra L_DEC_SG1;"
+    );
+    emit_xyzz_add_affine_inline(
+        out, "SG1_ADD", "ax", "ay", "azz", "azzz", "px", "py",
+    );
+    let _ = writeln!(out, "    bra L_DEC_SG1;\n\nL_DEC_SG2_INIT:");
+
+    // Save Q = [|z|]P in qx..qzzz and compute R = [|z|]Q = [z^2]P.
+    emit_fp_copy(out, "qx", "ax");
+    emit_fp_copy(out, "qy", "ay");
+    emit_fp_copy(out, "qzz", "azz");
+    emit_fp_copy(out, "qzzz", "azzz");
+    let _ = writeln!(
+        out,
+        r#"    mov.u32 %bit, 63;
+L_DEC_SG2:
+    setp.eq.u32 %p_loop, %bit, 0;
+    @%p_loop bra L_DEC_SG_CHK;
+    sub.u32 %bit, %bit, 1;"#
+    );
+    emit_xyzz_dbl_inline(out, "SG2_DBL", "ax", "ay", "azz", "azzz", true);
+    let _ = writeln!(
+        out,
+        "    shr.u64 %wtmp, %zabs, %bit;\n    \
+         and.b64 %wtmp, %wtmp, 1;\n    \
+         setp.ne.u64 %p_add, %wtmp, 0;\n    \
+         @!%p_add bra L_DEC_SG2;"
+    );
+    emit_fp_copy(out, "bx", "qx");
+    emit_fp_copy(out, "by", "qy");
+    emit_xyzz_add_inline(
+        out, "SG2_ADD", "ax", "ay", "azz", "azzz", "bx", "by", "qzz", "qzzz",
+    );
+    let _ = writeln!(out, "    bra L_DEC_SG2;\n\nL_DEC_SG_CHK:");
+
+    // R = (ax / azz, ay / azzz) must be finite and equal (beta * px, -py).
+    emit_fp_is_zero(out, "pz0", "azz");
+    let _ = writeln!(out, "    @%pz0 bra L_DEC_INVALID;");
+    emit_fp_load(out, "global", "ta", "prm_p", 48); // beta_mont
+    emit_fp_mul_call(out, "tb", "px", "ta");
+    emit_fp_mul_call(out, "tb", "tb", "azz");
+    let _ = writeln!(
+        out,
+        "    xor.b64 %mt0, %ax0, %tb0;\n    \
+         xor.b64 %mt1, %ax1, %tb1;\n    \
+         xor.b64 %mt2, %ax2, %tb2;\n    \
+         xor.b64 %mt3, %ax3, %tb3;\n    \
+         xor.b64 %mt4, %ax4, %tb4;\n    \
+         xor.b64 %mt5, %ax5, %tb5;\n    \
+         or.b64 %mt0, %mt0, %mt1;\n    \
+         or.b64 %mt2, %mt2, %mt3;\n    \
+         or.b64 %mt4, %mt4, %mt5;\n    \
+         or.b64 %mt0, %mt0, %mt2;\n    \
+         or.b64 %mt0, %mt0, %mt4;\n    \
+         setp.ne.u64 %pz0, %mt0, 0;\n    \
+         @%pz0 bra L_DEC_INVALID;"
+    );
+    emit_fp_neg(out, "ta", "py");
+    emit_fp_mul_call(out, "tb", "ta", "azzz");
+    let _ = writeln!(
+        out,
+        "    xor.b64 %mt0, %ay0, %tb0;\n    \
+         xor.b64 %mt1, %ay1, %tb1;\n    \
+         xor.b64 %mt2, %ay2, %tb2;\n    \
+         xor.b64 %mt3, %ay3, %tb3;\n    \
+         xor.b64 %mt4, %ay4, %tb4;\n    \
+         xor.b64 %mt5, %ay5, %tb5;\n    \
+         or.b64 %mt0, %mt0, %mt1;\n    \
+         or.b64 %mt2, %mt2, %mt3;\n    \
+         or.b64 %mt4, %mt4, %mt5;\n    \
+         or.b64 %mt0, %mt0, %mt2;\n    \
+         or.b64 %mt0, %mt0, %mt4;\n    \
+         setp.ne.u64 %pz0, %mt0, 0;\n    \
+         @%pz0 bra L_DEC_INVALID;"
+    );
+
+    // 7. Store validated Montgomery affine point (px, py) and status = 0.
+    let _ = writeln!(
+        out,
+        "    mul.wide.u32 %off, %tid_g, 96;\n    \
+         add.u64 %addr, %out_p, %off;"
+    );
+    emit_fp_store(out, "global", "addr", 0, "px");
+    emit_fp_store(out, "global", "addr", 48, "py");
+    let _ = writeln!(
+        out,
+        "    cvt.u64.u32 %off, %tid_g;\n    \
+         add.u64 %addr, %st_p, %off;\n    \
+         st.global.u8 [%addr], 0;\n    \
+         ret;\n\nL_DEC_INVALID:\n    \
+         cvt.u64.u32 %off, %tid_g;\n    \
+         add.u64 %addr, %st_p, %off;\n    \
+         st.global.u8 [%addr], 1;\n    \
+         ret;\n}}"
+    );
+}
+
 /// Generate the complete PTX source module for BLS12-381 GPU MSM & NTT kernels.
 pub(crate) fn generate_msm_ptx() -> String {
-    let mut out = String::with_capacity(80 * 1024);
+    let mut out = String::with_capacity(96 * 1024);
     let _ = writeln!(out, ".version 7.5\n.target sm_70\n.address_size 64\n");
     emit_fp_mul_val_func(&mut out);
     emit_fr_mul_val_func(&mut out);
     emit_msm_kernels(&mut out);
     emit_ntt_kernels(&mut out);
     emit_quotient_eval_kernel(&mut out);
+    emit_g1_decompress_kernel(&mut out);
     out
 }

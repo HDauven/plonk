@@ -69,21 +69,28 @@ Measured head-to-head on random BLS12-381 G1 points and 255-bit scalars (`1×` s
 
 Verification cost is $O(1)$ in circuit size (measured with 32 public inputs):
 
-| Operation | `master` | Phase 1 (`blst` `wbits`) | Phase 2 (Comb + GLV + Pipelined) | Speedup vs `master` |
+| Operation | `master` | `fast-plonk` (CPU 22c) | `fast-plonk` (`gpu-cuda`, RTX 5070 Ti) | Speedup vs `master` |
 |---|---:|---:|---:|---:|
-| **`Proof::from_bytes`** | `~870 µs` | `224.0 µs` | **`207.7 µs`** *(min `196.5 µs`)* | **4.2×** |
-| **Verify single (32 PI)** | `~2,550 µs` | `887.5 µs` idle / `1,016 µs` loaded | **`942.3 µs`** *(~800 µs idle)* | **2.7× – 3.2×** |
-| **Verify batch 16 (32 PI)** | `~40.8 ms` *(16×)* | `2.52 ms` (`157.5 µs/p`) | **`2.34 ms`** (**`146.2 µs/p`**) | **17.4×** |
-| **Verify batch 32 (32 PI)** | `~81.6 ms` *(32×)* | `3.54 ms` (`110.6 µs/p`) | **`2.86 ms`** (**`89.3 µs/p`**) | **28.6×** |
-| **Verify batch 64 (32 PI)** | `~163.2 ms` *(64×)* | `4.66 ms` (`72.8 µs/p`) | **`4.01 ms`** (**`62.6 µs/p`**) | **40.7×** |
+| **`Proof::from_bytes` (single)** | `~870 µs` | **`207.7 µs`** *(min `196.5 µs`)* | **`207.7 µs`** | **4.2×** |
+| **`Proof::from_bytes_batch` 256** | `~222.7 ms` *(256×)* | `12.76 ms` (`49.9 µs/p`) | **`4.15 ms`** (**`16.2 µs/p`**) | **53.7×** *(3.1× vs CPU)* |
+| **`Proof::from_bytes_batch` 1,024** | `~890.9 ms` *(1024×)* | `47.28 ms` (`46.2 µs/p`) | **`10.60 ms`** (**`10.3 µs/p`**) | **84.0×** *(4.5× vs CPU)* |
+| **`Proof::from_bytes_batch` 4,096** | `~3,563.5 ms` *(4096×)* | `187.45 ms` (`45.8 µs/p`) | **`23.70 ms`** (**`5.8 µs/p`**) | **150.4×** *(7.9× vs CPU)* |
+| **Verify single (32 PI)** | `~2,550 µs` | **`715.1 µs`** *(GLV 32-bit Comb)* | **`715.1 µs`** | **3.6×** |
+| **Verify batch 16 (32 PI)** | `~40.8 ms` *(16×)* | **`2.34 ms`** (`146.2 µs/p`) | **`2.34 ms`** | **17.4×** |
+| **Verify batch 32 (32 PI)** | `~81.6 ms` *(32×)* | **`2.86 ms`** (`89.3 µs/p`) | **`2.86 ms`** | **28.6×** |
+| **Verify batch 64 (32 PI)** | `~163.2 ms` *(64×)* | **`4.01 ms`** (`62.6 µs/p`) | **`4.01 ms`** | **40.7×** |
+| **Verify batch 256 (32 PI)** | `~652.8 ms` *(256×)* | `11.56 ms` (`45.1 µs/p`) | **`8.69 ms`** (**`33.9 µs/p`**) | **75.1×** *(1.33× vs CPU)* |
+| **Verify batch 1,024 (32 PI)** | `~2,611.2 ms` *(1024×)* | `31.48 ms` (`30.7 µs/p`) | **`21.90 ms`** (**`21.4 µs/p`**) | **119.2×** *(1.44× vs CPU)* |
+| **Verify batch 4,096 (32 PI)** | `~10,444.8 ms` *(4096×)* | `110.17 ms` (`26.9 µs/p`) | **`69.10 ms`** (**`16.9 µs/p`**) | **151.2×** *(1.59× vs CPU)* |
+| **Wire-bytes → Verified (4,096 proofs)** | `~14,008 ms` | `297.6 ms` (`72.7 µs/p`) | **`92.8 ms`** (**`22.7 µs/p`**) | **151.0×** *(3.21× vs CPU)* |
 
 ### Single-Verify Component Breakdown (`blst` backend)
 
-| Component | Phase 1 | Phase 2 | Notes |
-|---|---:|---:|---|
-| Static 16-pt MSM | `265–321 µs` (`blst_p1s_mult_wbits`) | **`~218 µs`** (serial) | 4-tooth × 2-group × 8-pt variable-time Comb (`192 KiB`), no constant-time linear table scans |
-| Dynamic 11-pt + `left` MSM | `~260–420 µs` | **`~349 µs`** (2-way par with static) | 128-bit GLV Straus (`w = 5`), zero constant-time `wbits` fallback |
-| 2-pair Pairing (`ml1 + ml2 + finalverify`) | `~470–555 µs` | **`~355 µs` exposed** | `ml1(w_z + u·w_zw, x·H)` (~115 µs) is pipelined concurrently with the right MSM; serial `ml2 + finalverify` avoids sub-ms Rayon wakeup jitter |
+| Component | Phase 1 (`blst` `wbits`) | Phase 2 (64-bit Comb) | Phase 3 (GLV `-phi` 32-bit Comb + 4-way) | Notes |
+|---|---:|---:|---:|---|
+| Static 16-pt MSM | `265–321 µs` | `~218 µs` | **`~100 µs` wall** | 4-tooth × 2-group × 8-pt GLV 32-bit Comb (`192 KiB`, `31` doublings per 128-bit half in parallel, merged via `-phi(X, Y, Z) = (beta*X, -Y, Z)`) |
+| Dynamic 11-pt + `left` + `ml1` | `~375–535 µs` | `~349 µs` | **`~175 µs` wall** | 4-way balanced split across `neg_left+ml1`, `static_rem+dyn`, `static_q+dyn`, and `dyn` |
+| Exposed Pairing (`ml2 + finalverify`) | `~355 µs` | `~355 µs` | **`~355 µs`** | Serial `ml2 + finalverify` after `ml1` finishes hidden behind MSM |
 
 ---
 

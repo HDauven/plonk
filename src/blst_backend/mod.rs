@@ -36,6 +36,8 @@ pub(crate) use msm::{msm_g1, msm_g1_batch, msm_g1_variable_base};
 pub(crate) use msm_affine::msm_g1_batch_affine;
 pub(crate) use msm_lagrange::{g1_ifft_blst, msm_g1_lagrange_batch};
 use rayon::prelude::*;
+#[cfg(feature = "gpu-cuda")]
+pub(crate) use verify::glv_beta;
 #[cfg(test)]
 pub(crate) use verify::verify_pairing_lines;
 pub(crate) use verify::{

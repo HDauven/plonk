@@ -36,8 +36,11 @@ pub(crate) type SplitQuotientWithComms = ([Vec<BlsScalar>; 4], [G1Affine; 4]);
 type MsmInnerResult<const K: usize, R> =
     Result<Option<([G1Affine; K], R)>, (&'static str, i32)>;
 
-/// Minimum polynomial length to offload an MSM to GPU.
+/// Minimum polynomial length to offload a prover MSM to GPU.
 pub(crate) const GPU_MSM_MIN_LEN: usize = 4096;
+
+/// Minimum point count to offload a batch-verifier variable-base MSM to GPU.
+pub(crate) const GPU_VERIFY_MSM_MIN_LEN: usize = 2048;
 
 /// Minimum domain size `n` to offload the full 8-coset quotient engine
 /// (NTT + pointwise widgets + IFFT) to GPU.
@@ -74,6 +77,7 @@ struct GpuSplitMerge {
 }
 
 struct GpuMsmScratch {
+    dyn_bases: CudaBuf,
     scalars_mont: CudaBuf,
     scalars_std: CudaBuf,
     counts: CudaBuf,
@@ -86,6 +90,7 @@ struct GpuMsmScratch {
     merges: CudaBuf,
     buckets: CudaBuf,
     window_sums: CudaBuf,
+    host_bases: CudaHostBuf<blst_p1_affine>,
     host_packed: CudaHostBuf<[u64; 4]>,
     host_totals: CudaHostBuf<u32>,
     host_wsums: CudaHostBuf<GpuXyzz>,
@@ -94,6 +99,7 @@ struct GpuMsmScratch {
 impl GpuMsmScratch {
     fn new(drv: &'static CudaDriver) -> Result<Self, i32> {
         Ok(Self {
+            dyn_bases: CudaBuf::alloc(drv, 16)?,
             scalars_mont: CudaBuf::alloc(drv, 16)?,
             scalars_std: CudaBuf::alloc(drv, 16)?,
             counts: CudaBuf::alloc(drv, 16)?,
@@ -106,6 +112,7 @@ impl GpuMsmScratch {
             merges: CudaBuf::alloc(drv, 16)?,
             buckets: CudaBuf::alloc(drv, 16)?,
             window_sums: CudaBuf::alloc(drv, 16)?,
+            host_bases: CudaHostBuf::new(drv),
             host_packed: CudaHostBuf::new(drv),
             host_totals: CudaHostBuf::new(drv),
             host_wsums: CudaHostBuf::new(drv),
@@ -139,6 +146,45 @@ impl GpuNttScratch {
     }
 }
 
+struct GpuDecompressScratch {
+    in_bytes: CudaBuf,
+    out_points: CudaBuf,
+    status: CudaBuf,
+    params: CudaBuf,
+    host_in: CudaHostBuf<u8>,
+    host_out: CudaHostBuf<blst_p1_affine>,
+    host_status: CudaHostBuf<u8>,
+}
+
+impl GpuDecompressScratch {
+    fn new(drv: &'static CudaDriver) -> Result<Self, i32> {
+        // `[e_sqrt_limbs (48 B) || beta_mont (48 B)]`
+        const E_SQRT: [u64; 6] = [
+            0xee7f_bfff_ffff_eaab,
+            0x07aa_ffff_ac54_ffff,
+            0xd9cc_34a8_3dac_3d89,
+            0xd91d_d2e1_3ce1_44af,
+            0x92c6_e9ed_90d2_eb35,
+            0x0680_447a_8e5f_f9a6,
+        ];
+        let beta = crate::blst_backend::glv_beta().l;
+        let mut params_h = [0u64; 12];
+        params_h[..6].copy_from_slice(&E_SQRT);
+        params_h[6..12].copy_from_slice(&beta);
+        let params = CudaBuf::alloc(drv, 96)?;
+        drv.copy_htod(params.ptr, &params_h)?;
+        Ok(Self {
+            in_bytes: CudaBuf::alloc(drv, 48)?,
+            out_points: CudaBuf::alloc(drv, 96)?,
+            status: CudaBuf::alloc(drv, 16)?,
+            params,
+            host_in: CudaHostBuf::new(drv),
+            host_out: CudaHostBuf::new(drv),
+            host_status: CudaHostBuf::new(drv),
+        })
+    }
+}
+
 struct GpuRuntime {
     drv: &'static CudaDriver,
     fn_count: CuFunction,
@@ -154,10 +200,12 @@ struct GpuRuntime {
     fn_ntt_radix2: CuFunction,
     fn_quot_eval: CuFunction,
     fn_quot_combine: CuFunction,
+    fn_g1_decompress: CuFunction,
     #[cfg(test)]
     fn_test_fp: CuFunction,
     scratch: Mutex<GpuMsmScratch>,
     ntt_scratch: Mutex<GpuNttScratch>,
+    dec_scratch: Mutex<GpuDecompressScratch>,
 }
 
 // SAFETY: `CuFunction` handles are process-lifetime immutable handles owned by
@@ -177,7 +225,8 @@ fn gpu_runtime() -> Option<&'static GpuRuntime> {
                 Ok(m) => m,
                 Err(_err) => {
                     #[cfg(test)]
-                    eprintln!("fast-plonk gpu-cuda PTX JIT failed: {_err}");
+                    panic!("fast-plonk gpu-cuda PTX JIT failed: {_err}");
+                    #[cfg(not(test))]
                     return None;
                 }
             };
@@ -207,10 +256,14 @@ fn gpu_runtime() -> Option<&'static GpuRuntime> {
                 drv.get_function(module, "quotient_eval_wave").ok()?;
             let fn_quot_combine =
                 drv.get_function(module, "quotient_radix8_combine").ok()?;
+            let fn_g1_decompress = drv
+                .get_function(module, "g1_decompress_and_subgroup_check")
+                .ok()?;
             #[cfg(test)]
             let fn_test_fp = drv.get_function(module, "test_fp_ops").ok()?;
             let scratch = GpuMsmScratch::new(drv).ok()?;
             let ntt_scratch = GpuNttScratch::new(drv).ok()?;
+            let dec_scratch = GpuDecompressScratch::new(drv).ok()?;
             Some(GpuRuntime {
                 drv,
                 fn_count,
@@ -226,10 +279,12 @@ fn gpu_runtime() -> Option<&'static GpuRuntime> {
                 fn_ntt_radix2,
                 fn_quot_eval,
                 fn_quot_combine,
+                fn_g1_decompress,
                 #[cfg(test)]
                 fn_test_fp,
                 scratch: Mutex::new(scratch),
                 ntt_scratch: Mutex::new(ntt_scratch),
+                dec_scratch: Mutex::new(dec_scratch),
             })
         })
         .as_ref()
@@ -827,6 +882,419 @@ impl GpuCommitBases {
 
         Ok(Some((blst_p1s_to_g1_affines(&projs), overlapped_res)))
     }
+}
+
+/// Evaluate a variable-base G1 MSM on GPU (uploading the dynamic affine bases
+/// and scalars via pinned DMA), invoking `while_gpu_busy` concurrently on CPU
+/// while the asynchronous GPU accumulate/merge/reduce pipeline runs.
+pub(crate) fn msm_variable_base_gpu_with_overlap<F, R>(
+    points: &[G1Affine],
+    scalars: &[BlsScalar],
+    while_gpu_busy: F,
+) -> Option<(blst_p1, R)>
+where
+    F: FnOnce() -> R,
+{
+    let n = points.len().min(scalars.len());
+    if n < GPU_VERIFY_MSM_MIN_LEN {
+        return None;
+    }
+    let rt = gpu_runtime()?;
+    rt.drv.bind_ctx().ok()?;
+
+    // Filter out identity points and zero scalars in parallel chunks.
+    let active_pairs: Vec<(blst_p1_affine, [u64; 4])> = points[..n]
+        .par_iter()
+        .zip(scalars[..n].par_iter())
+        .filter_map(|(pt, sc)| {
+            if bool::from(pt.is_identity()) || *sc == BlsScalar::zero() {
+                None
+            } else {
+                Some((
+                    crate::blst_backend::g1_affine_to_blst(pt),
+                    *sc.internal_repr(),
+                ))
+            }
+        })
+        .collect();
+
+    let msm_len = active_pairs.len();
+    if msm_len == 0 {
+        return Some((blst_p1::default(), while_gpu_busy()));
+    }
+
+    let w = choose_gpu_window(msm_len);
+    let ny = 256usize.div_ceil(w);
+    let num_buckets = 1usize << (w - 1);
+    let total_buckets = ny * num_buckets;
+    let log_chunk = (num_buckets / 64).trailing_zeros();
+
+    let mut scratch_guard = rt.scratch.lock().ok()?;
+    let scratch = &mut *scratch_guard;
+    let bases_bytes = msm_len * core::mem::size_of::<blst_p1_affine>();
+    let scalars_bytes = msm_len * 32;
+    scratch.dyn_bases.ensure_capacity(bases_bytes).ok()?;
+    scratch.scalars_mont.ensure_capacity(scalars_bytes).ok()?;
+    scratch.scalars_std.ensure_capacity(scalars_bytes).ok()?;
+    scratch.counts.ensure_capacity(total_buckets * 4).ok()?;
+    scratch.cursors.ensure_capacity(total_buckets * 4).ok()?;
+    scratch
+        .window_sums
+        .ensure_capacity(ny * core::mem::size_of::<GpuXyzz>())
+        .ok()?;
+
+    let host_bases = scratch.host_bases.ensure_len(msm_len);
+    let host_packed = scratch.host_packed.ensure_len(msm_len);
+    host_bases
+        .par_chunks_mut(1024)
+        .zip(host_packed.par_chunks_mut(1024))
+        .zip(active_pairs.par_chunks(1024))
+        .for_each(|((b_dst, s_dst), src)| {
+            for ((bd, sd), &(bp, sp)) in
+                b_dst.iter_mut().zip(s_dst.iter_mut()).zip(src.iter())
+            {
+                *bd = bp;
+                *sd = sp;
+            }
+        });
+
+    rt.drv.copy_htod(scratch.dyn_bases.ptr, host_bases).ok()?;
+    rt.drv
+        .copy_htod(scratch.scalars_mont.ptr, host_packed)
+        .ok()?;
+    rt.drv
+        .memset_zero(scratch.counts.ptr, total_buckets * 4)
+        .ok()?;
+
+    let mut p_sm = scratch.scalars_mont.ptr;
+    let mut p_ss = scratch.scalars_std.ptr;
+    let mut p_cnt = scratch.counts.ptr;
+    let mut p_msm_len = msm_len as u32;
+    let mut p_total_sc = msm_len as u32;
+    let mut p_w = w as u32;
+    let mut p_ny = ny as u32;
+    let mut p_nb = num_buckets as u32;
+    let mut params_cnt: [*mut c_void; 8] = [
+        (&mut p_sm as *mut u64).cast(),
+        (&mut p_ss as *mut u64).cast(),
+        (&mut p_cnt as *mut u64).cast(),
+        (&mut p_msm_len as *mut u32).cast(),
+        (&mut p_total_sc as *mut u32).cast(),
+        (&mut p_w as *mut u32).cast(),
+        (&mut p_ny as *mut u32).cast(),
+        (&mut p_nb as *mut u32).cast(),
+    ];
+    let grid_sc = (msm_len as u32).div_ceil(256);
+    // SAFETY: matches `msm_count_buckets` signature.
+    unsafe {
+        rt.drv
+            .launch(
+                rt.fn_count,
+                (grid_sc, 1, 1),
+                (256, 1, 1),
+                0,
+                &mut params_cnt,
+            )
+            .ok()?;
+    }
+
+    let num_blocks = total_buckets.div_ceil(256);
+    scratch.block_totals.ensure_capacity(num_blocks * 16).ok()?;
+    scratch
+        .block_offsets
+        .ensure_capacity(num_blocks * 16)
+        .ok()?;
+    let mut p_max_chunk = ((msm_len / num_buckets) * 2).max(32) as u32;
+    let mut p_total_b = total_buckets as u32;
+    let mut p_num_blks = num_blocks as u32;
+    let mut p_btot = scratch.block_totals.ptr;
+    let mut p_boff = scratch.block_offsets.ptr;
+    let mut p_tout = scratch.totals_out.ptr;
+
+    let mut params_sb: [*mut c_void; 4] = [
+        (&mut p_cnt as *mut u64).cast(),
+        (&mut p_btot as *mut u64).cast(),
+        (&mut p_total_b as *mut u32).cast(),
+        (&mut p_max_chunk as *mut u32).cast(),
+    ];
+    // SAFETY: matches `msm_scan_blocks` signature.
+    unsafe {
+        rt.drv
+            .launch(
+                rt.fn_scan_blocks,
+                (p_num_blks, 1, 1),
+                (256, 1, 1),
+                0,
+                &mut params_sb,
+            )
+            .ok()?;
+    }
+    let mut params_st: [*mut c_void; 5] = [
+        (&mut p_btot as *mut u64).cast(),
+        (&mut p_boff as *mut u64).cast(),
+        (&mut p_tout as *mut u64).cast(),
+        (&mut p_num_blks as *mut u32).cast(),
+        (&mut p_total_b as *mut u32).cast(),
+    ];
+    // SAFETY: matches `msm_scan_block_totals` signature.
+    unsafe {
+        rt.drv
+            .launch(
+                rt.fn_scan_totals,
+                (1, 1, 1),
+                (256, 1, 1),
+                0,
+                &mut params_st,
+            )
+            .ok()?;
+    }
+
+    let totals_h = scratch.host_totals.ensure_len(4);
+    rt.drv.copy_dtoh(totals_h, p_tout).ok()?;
+    let total_entries = totals_h[0] as usize;
+    let num_tasks = totals_h[1] as usize;
+    let num_merges = totals_h[2] as usize;
+    let total_bucket_slots = totals_h[3] as usize;
+    if total_entries == 0 || num_tasks == 0 {
+        drop(scratch_guard);
+        return Some((blst_p1::default(), while_gpu_busy()));
+    }
+
+    scratch.sorted.ensure_capacity(total_entries * 4).ok()?;
+    scratch
+        .tasks
+        .ensure_capacity(num_tasks * core::mem::size_of::<GpuAccTask>())
+        .ok()?;
+    scratch
+        .buckets
+        .ensure_capacity(total_bucket_slots * core::mem::size_of::<GpuXyzz>())
+        .ok()?;
+    if num_merges > 0 {
+        scratch
+            .merges
+            .ensure_capacity(num_merges * core::mem::size_of::<GpuSplitMerge>())
+            .ok()?;
+    }
+
+    let mut p_cur = scratch.cursors.ptr;
+    let mut p_tsk = scratch.tasks.ptr;
+    let mut p_mrg = scratch.merges.ptr;
+    let mut p_bkt = scratch.buckets.ptr;
+    let mut params_bt: [*mut c_void; 8] = [
+        (&mut p_cnt as *mut u64).cast(),
+        (&mut p_boff as *mut u64).cast(),
+        (&mut p_cur as *mut u64).cast(),
+        (&mut p_tsk as *mut u64).cast(),
+        (&mut p_mrg as *mut u64).cast(),
+        (&mut p_bkt as *mut u64).cast(),
+        (&mut p_total_b as *mut u32).cast(),
+        (&mut p_max_chunk as *mut u32).cast(),
+    ];
+    // SAFETY: matches `msm_build_tasks` signature.
+    unsafe {
+        rt.drv
+            .launch(
+                rt.fn_build_tasks,
+                (p_num_blks, 1, 1),
+                (256, 1, 1),
+                0,
+                &mut params_bt,
+            )
+            .ok()?;
+    }
+
+    let mut p_srt = scratch.sorted.ptr;
+    let mut params_sct: [*mut c_void; 8] = [
+        (&mut p_ss as *mut u64).cast(),
+        (&mut p_cur as *mut u64).cast(),
+        (&mut p_srt as *mut u64).cast(),
+        (&mut p_msm_len as *mut u32).cast(),
+        (&mut p_total_sc as *mut u32).cast(),
+        (&mut p_w as *mut u32).cast(),
+        (&mut p_ny as *mut u32).cast(),
+        (&mut p_nb as *mut u32).cast(),
+    ];
+    // SAFETY: matches `msm_scatter_indices` signature.
+    unsafe {
+        rt.drv
+            .launch(
+                rt.fn_scatter,
+                (grid_sc, 1, 1),
+                (256, 1, 1),
+                0,
+                &mut params_sct,
+            )
+            .ok()?;
+    }
+
+    let mut p_bases = scratch.dyn_bases.ptr;
+    let mut p_num_t = num_tasks as u32;
+    let mut params_acc: [*mut c_void; 5] = [
+        (&mut p_bases as *mut u64).cast(),
+        (&mut p_tsk as *mut u64).cast(),
+        (&mut p_srt as *mut u64).cast(),
+        (&mut p_bkt as *mut u64).cast(),
+        (&mut p_num_t as *mut u32).cast(),
+    ];
+    let grid_tsk = p_num_t.div_ceil(128);
+    // SAFETY: matches `msm_accumulate_tasks` signature.
+    unsafe {
+        rt.drv
+            .launch(
+                rt.fn_accumulate,
+                (grid_tsk, 1, 1),
+                (128, 1, 1),
+                0,
+                &mut params_acc,
+            )
+            .ok()?;
+    }
+    if num_merges > 0 {
+        let mut params_mrg: [*mut c_void; 2] = [
+            (&mut p_bkt as *mut u64).cast(),
+            (&mut p_mrg as *mut u64).cast(),
+        ];
+        // SAFETY: matches `msm_merge_split_buckets` signature.
+        unsafe {
+            rt.drv
+                .launch(
+                    rt.fn_merge,
+                    (num_merges as u32, 1, 1),
+                    (32, 1, 1),
+                    0,
+                    &mut params_mrg,
+                )
+                .ok()?;
+        }
+    }
+    let mut p_wsums = scratch.window_sums.ptr;
+    let mut p_log_c = log_chunk;
+    let mut params_red: [*mut c_void; 4] = [
+        (&mut p_bkt as *mut u64).cast(),
+        (&mut p_wsums as *mut u64).cast(),
+        (&mut p_nb as *mut u32).cast(),
+        (&mut p_log_c as *mut u32).cast(),
+    ];
+    // SAFETY: matches `msm_reduce_windows` signature.
+    unsafe {
+        rt.drv
+            .launch(
+                rt.fn_reduce,
+                (ny as u32, 1, 1),
+                (64, 1, 1),
+                0,
+                &mut params_red,
+            )
+            .ok()?;
+    }
+
+    let overlapped = while_gpu_busy();
+    let wsums_h = scratch.host_wsums.ensure_len(ny);
+    rt.drv.copy_dtoh(wsums_h, scratch.window_sums.ptr).ok()?;
+    let wsums_aff = xyzz_batch_to_blst_affine(wsums_h);
+    drop(scratch_guard);
+
+    let mut acc = blst_p1::default();
+    for wi in (0..ny).rev() {
+        let cur = acc;
+        // SAFETY: valid Jacobian + affine pointers.
+        unsafe {
+            blst_p1_add_or_double_affine(&mut acc, &cur, &wsums_aff[wi]);
+        }
+        if wi > 0 {
+            for _ in 0..w {
+                let cur = acc;
+                // SAFETY: valid Jacobian point.
+                unsafe { blst_p1_double(&mut acc, &cur) };
+            }
+        }
+    }
+    Some((acc, overlapped))
+}
+
+/// Decompress and prime-order subgroup-check a batch of 48-byte compressed
+/// BLS12-381 G1 points on GPU, overlapping `while_gpu_busy` concurrently on CPU
+/// (e.g. decoding proof field evaluations).
+///
+/// Returns `None` if no CUDA GPU is available; otherwise `Some(Ok((points, r)))`
+/// or `Some(Err(InvalidData))` if any compressed point is malformed or not in G1.
+pub(crate) fn decode_g1_compressed_batch_gpu_with_overlap<F, R>(
+    compressed: &[[u8; 48]],
+    while_gpu_busy: F,
+) -> Option<Result<(Vec<G1Affine>, R), dusk_bytes::Error>>
+where
+    F: FnOnce() -> R,
+{
+    let count = compressed.len();
+    if count == 0 {
+        return Some(Ok((Vec::new(), while_gpu_busy())));
+    }
+    let rt = gpu_runtime()?;
+    rt.drv.bind_ctx().ok()?;
+
+    let mut scratch_guard = rt.dec_scratch.lock().ok()?;
+    let scratch = &mut *scratch_guard;
+    scratch.in_bytes.ensure_capacity(count * 48).ok()?;
+    scratch
+        .out_points
+        .ensure_capacity(count * core::mem::size_of::<blst_p1_affine>())
+        .ok()?;
+    scratch.status.ensure_capacity(count).ok()?;
+
+    let host_in = scratch.host_in.ensure_len(count * 48);
+    let (host_chunks, _) = host_in.as_chunks_mut::<48>();
+    host_chunks.copy_from_slice(compressed);
+    rt.drv.copy_htod(scratch.in_bytes.ptr, host_in).ok()?;
+
+    let mut p_in = scratch.in_bytes.ptr;
+    let mut p_prm = scratch.params.ptr;
+    let mut p_out = scratch.out_points.ptr;
+    let mut p_st = scratch.status.ptr;
+    let mut p_cnt = count as u32;
+    let mut params_dec: [*mut c_void; 5] = [
+        (&mut p_in as *mut u64).cast(),
+        (&mut p_prm as *mut u64).cast(),
+        (&mut p_out as *mut u64).cast(),
+        (&mut p_st as *mut u64).cast(),
+        (&mut p_cnt as *mut u32).cast(),
+    ];
+    let grid = p_cnt.div_ceil(128);
+    // SAFETY: matches `g1_decompress_and_subgroup_check` PTX signature.
+    unsafe {
+        rt.drv
+            .launch(
+                rt.fn_g1_decompress,
+                (grid, 1, 1),
+                (128, 1, 1),
+                0,
+                &mut params_dec,
+            )
+            .ok()?;
+    }
+
+    let overlapped = while_gpu_busy();
+
+    let host_st = scratch.host_status.ensure_len(count);
+    rt.drv.copy_dtoh(host_st, scratch.status.ptr).ok()?;
+    if host_st.iter().any(|&s| s != 0) {
+        return Some(Err(dusk_bytes::Error::InvalidData));
+    }
+
+    let host_out = scratch.host_out.ensure_len(count);
+    rt.drv.copy_dtoh(host_out, scratch.out_points.ptr).ok()?;
+    let pts: Vec<G1Affine> = if count >= 256 && rayon::current_num_threads() > 1
+    {
+        host_out
+            .par_iter()
+            .map(crate::blst_backend::blst_p1_affine_to_g1)
+            .collect()
+    } else {
+        host_out
+            .iter()
+            .map(crate::blst_backend::blst_p1_affine_to_g1)
+            .collect()
+    };
+    Some(Ok((pts, overlapped)))
 }
 
 /// Device-resident `Fr` NTT twiddle, coset, and selector tables owned lazily by
@@ -2659,5 +3127,207 @@ mod tests {
                 beta == BlsScalar::zero()
             );
         }
+    }
+
+    #[test]
+    fn gpu_cuda_g1_decompress_and_subgroup_check_adversarial() {
+        if !is_gpu_available() {
+            eprintln!("skipping gpu_cuda G1 decompress test: no CUDA GPU");
+            return;
+        }
+        use dusk_bytes::Serializable;
+
+        let mut rng = StdRng::seed_from_u64(0xdead_b157);
+        let mut valid_bytes = Vec::with_capacity(600);
+        let mut expected_pts = Vec::with_capacity(600);
+
+        // Identity + generator + -generator + 512 random G1 points (both signs)
+        valid_bytes.push(G1Affine::identity().to_bytes());
+        expected_pts.push(G1Affine::identity());
+        let g = G1Affine::generator();
+        valid_bytes.push(g.to_bytes());
+        expected_pts.push(g);
+        valid_bytes.push((-g).to_bytes());
+        expected_pts.push(-g);
+
+        for _ in 0..512 {
+            let s = BlsScalar::random(&mut rng);
+            let p = G1Affine::from(G1Projective::generator() * s);
+            valid_bytes.push(p.to_bytes());
+            expected_pts.push(p);
+        }
+
+        let (gpu_pts, ()) =
+            decode_g1_compressed_batch_gpu_with_overlap(&valid_bytes, || ())
+                .expect("GPU available")
+                .expect("all valid G1 points must decode cleanly");
+        assert_eq!(gpu_pts, expected_pts);
+
+        // Adversarial invalid encodings: every single one MUST be rejected!
+        let mut invalids: Vec<(&'static str, [u8; 48])> = Vec::new();
+        // 1) Missing compression flag (bit 7 = 0)
+        let mut no_comp = g.to_bytes();
+        no_comp[0] &= 0x7f;
+        invalids.push(("missing_comp_flag", no_comp));
+        // 2) Infinity with sort bit set (0xe0...)
+        let mut inf_sort = [0u8; 48];
+        inf_sort[0] = 0xe0;
+        invalids.push(("inf_with_sort", inf_sort));
+        // 3) Infinity with nonzero payload (0xc0...01)
+        let mut inf_payload = [0u8; 48];
+        inf_payload[0] = 0xc0;
+        inf_payload[47] = 1;
+        invalids.push(("inf_nonzero_payload", inf_payload));
+        // 4) Non-canonical x == p
+        let mut x_eq_p = [0u8; 48];
+        for (i, &limb) in ptx::FP_P.iter().enumerate() {
+            x_eq_p[(5 - i) * 8..(6 - i) * 8]
+                .copy_from_slice(&limb.to_be_bytes());
+        }
+        x_eq_p[0] |= 0x80;
+        invalids.push(("x_eq_p", x_eq_p));
+        // 5) Non-canonical x == p + 1
+        let mut x_gt_p = x_eq_p;
+        x_gt_p[47] = x_gt_p[47].wrapping_add(1);
+        invalids.push(("x_gt_p", x_gt_p));
+
+        // 6) Off-curve points AND on-curve non-subgroup torsion points!
+        let mut found_off_curve = 0usize;
+        let mut found_non_subgroup = 0usize;
+        for x_val in 0u64..2000 {
+            let mut raw = [0u8; 48];
+            raw[40..48].copy_from_slice(&x_val.to_be_bytes());
+            raw[0] |= 0x80;
+            let mut pt = blst_p1_affine::default();
+            // SAFETY: valid 48-byte buffer and output pointer.
+            let err =
+                unsafe { blst::blst_p1_uncompress(&mut pt, raw.as_ptr()) };
+            if err != blst::BLST_ERROR::BLST_SUCCESS {
+                if found_off_curve < 5 {
+                    invalids.push(("off_curve", raw));
+                    found_off_curve += 1;
+                }
+            } else {
+                // SAFETY: `pt` was decoded on-curve by `blst_p1_uncompress`.
+                let in_g1 = unsafe { blst::blst_p1_affine_in_g1(&pt) };
+                if !in_g1 && found_non_subgroup < 10 {
+                    invalids.push(("non_subgroup_torsion", raw));
+                    let mut raw_flip = raw;
+                    raw_flip[0] ^= 0x20;
+                    invalids.push(("non_subgroup_torsion_neg", raw_flip));
+                    found_non_subgroup += 1;
+                }
+            }
+            if found_off_curve >= 5 && found_non_subgroup >= 10 {
+                break;
+            }
+        }
+        assert!(found_off_curve >= 5);
+        assert!(found_non_subgroup >= 10);
+
+        for (label, bad) in invalids {
+            let mut batch = vec![g.to_bytes(); 32];
+            batch[17] = bad;
+            let res =
+                decode_g1_compressed_batch_gpu_with_overlap(&batch, || ())
+                    .expect("GPU available");
+            assert!(
+                res.is_err(),
+                "GPU G1 decoder failed to reject adversarial case: {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_cuda_batch_verify_and_from_bytes_batch_end_to_end() {
+        if !is_gpu_available() {
+            eprintln!("skipping gpu_cuda batch verify test: no CUDA GPU");
+            return;
+        }
+        use crate::composer::{Composer, Constraint};
+        use crate::prelude::{
+            Circuit, Compiler, Error, Proof, PublicParameters,
+        };
+        use dusk_bytes::Serializable;
+
+        // 1) Direct GPU variable-base MSM vs CPU blst at n = 2500 with zeros & identities.
+        let mut rng = StdRng::seed_from_u64(0xba7c_b007);
+        let n = 2500usize;
+        let mut pts: Vec<G1Affine> = (0..n)
+            .map(|_| {
+                G1Affine::from(
+                    G1Projective::generator() * BlsScalar::random(&mut rng),
+                )
+            })
+            .collect();
+        let mut scs: Vec<BlsScalar> =
+            (0..n).map(|_| BlsScalar::random(&mut rng)).collect();
+        pts[0] = G1Affine::identity();
+        pts[1337] = G1Affine::identity();
+        scs[42] = BlsScalar::zero();
+        scs[n - 1] = BlsScalar::zero();
+
+        let (gpu_proj, tag) =
+            msm_variable_base_gpu_with_overlap(&pts, &scs, || 12345u32)
+                .expect("GPU var-base MSM should succeed");
+        assert_eq!(tag, 12345u32);
+        let gpu_aff = blst_p1s_to_g1_affines(&[gpu_proj])[0];
+        let cpu_aff = crate::blst_backend::msm_g1_variable_base(&pts, &scs);
+        assert_eq!(gpu_aff, cpu_aff);
+
+        // 2) End-to-end 256-proof `from_bytes_batch` + `verify_batch` (triggers
+        // BOTH GPU batch decompression and GPU variable-base batch verify MSM!).
+        #[derive(Default)]
+        struct TinyCircuit;
+        impl Circuit for TinyCircuit {
+            fn circuit(&self, composer: &mut Composer) -> Result<(), Error> {
+                let a = composer.append_witness(BlsScalar::from(7u64));
+                let b = composer.append_witness(BlsScalar::from(9u64));
+                let c = composer.gate_mul(Constraint::new().mult(1).a(a).b(b));
+                composer.assert_equal_constant(
+                    c,
+                    0,
+                    Some(BlsScalar::from(63u64)),
+                );
+                Ok(())
+            }
+        }
+        let pp = PublicParameters::setup(1 << 6, &mut rng).unwrap();
+        let (prover, verifier) =
+            Compiler::compile::<TinyCircuit>(&pp, b"gpu-batch-verify").unwrap();
+        let base_proofs: Vec<(Proof, Vec<BlsScalar>)> = (0..8)
+            .map(|_| prover.prove(&mut rng, &TinyCircuit).unwrap())
+            .collect();
+        let batch_bytes: Vec<[u8; Proof::SIZE]> = (0..256)
+            .map(|i| base_proofs[i % base_proofs.len()].0.to_bytes())
+            .collect();
+
+        let decoded = Proof::from_bytes_batch(&batch_bytes)
+            .expect("GPU from_bytes_batch should decode 256 valid proofs");
+        assert_eq!(decoded.len(), 256);
+        for (i, p) in decoded.iter().enumerate() {
+            assert_eq!(*p, base_proofs[i % base_proofs.len()].0);
+        }
+
+        let items: Vec<(&Proof, &[BlsScalar])> = decoded
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p, base_proofs[i % base_proofs.len()].1.as_slice()))
+            .collect();
+        verifier
+            .verify_batch(&items)
+            .expect("GPU-accelerated 256-proof batch verify must pass");
+
+        // Corrupt one proof in the 256-proof batch -> MUST reject!
+        let mut raw_bad = decoded[199].to_bytes();
+        // Flip the sign bit of `a_comm` (still a valid G1 point `-a_comm`, wrong proof!)
+        raw_bad[0] ^= 0x20;
+        let bad_proof = Proof::from_bytes(&raw_bad).unwrap();
+        let mut bad_items = items;
+        bad_items[199].0 = &bad_proof;
+        assert!(
+            verifier.verify_batch(&bad_items).is_err(),
+            "corrupted proof inside 256-proof GPU batch must be rejected"
+        );
     }
 }

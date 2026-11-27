@@ -27,9 +27,9 @@ Details of the underlying protocol are available in the [PLONK specification](do
 - **Batched-Affine Pippenger MSM**: L2-resident `96 B/bucket` affine Pippenger over `blst_fp` assembly using Montgomery batch inversion (`1` inversion per up to `256` additions), narrow-top-window XYZZ dispatch, and skewed-bucket Jacobian overflow protection — up to **1.46× faster than `blst`'s XYZZ Pippenger** at `2^16`.
 - **Optional Native CUDA GPU Backend (`gpu-cuda`)**: Zero-dependency (`dlopen("libcuda.so.1")` + embedded `.version 7.5 / sm_70` PTX — no `nvcc`, no `cmake`, no license server) GPU acceleration supporting Volta through Blackwell (SM 12.0). Features 100% register-resident BLS12-381 `Fp`/XYZZ Pippenger MSM with on-GPU bucket prefix-scan/task-builder, adaptive sub-bucket chunking, and 64-thread parallel tree reduction; GPU batched IFFTs (`wire`, `z`, `pi`); full-VRAM 8-coset quotient pipeline (`quotient_eval_wave` for all 6 Dusk PLONK widgets + `quotient_radix8_combine`); CPU/GPU overlapped `FastFr -> BlsScalar` post-processing during async MSM execution; zero-`to_bls` Round-5 `FastFr` opening MSMs; reusable page-locked (`cuMemAllocHost_v2`) DMA buffers; and automatic fallback to CPU when no CUDA GPU is present.
 - **Verification & Batch Verification**:
-  - Parallel `Proof::from_bytes` G1 decompression via `blst` (**4.2× faster**).
-  - Precomputed 4-tooth × 2-group × 8-point variable-time Comb table for static verifier commitments (`192 KiB`) + 128-bit BLS12-381 GLV Straus (`w = 5`) for dynamic commitments + pipelined `ml1` Miller loop overlapped with the right MSM.
-  - Same-circuit (`Verifier::verify_batch`) and cross-circuit (`BatchVerifier`) randomized batch verification using 129-bit GLV-decomposed Pippenger and a single shared pairing check (**~61 µs/proof at batch size 64**).
+  - Parallel `Proof::from_bytes` G1 decompression via `blst` (**4.2× faster**), plus **`Proof::from_bytes_batch`** with GPU G1 decompression + exact `[z^2]P == -phi(P)` prime-order subgroup verification (**`23.7 ms` for 4,096 proofs = `5.8 µs/proof`**, **150× vs `master`**, **7.9× vs 22-core CPU**).
+  - Precomputed 4-tooth × 2-group × 8-point **GLV `-phi` 32-bit Comb** table (`192 KiB`, `31` doublings per 128-bit half) + 128-bit GLV Straus (`w = 5`) + balanced 4-way pipelined `ml1` Miller loop (**`715 µs` single verify**, **3.6× vs `master`**).
+  - Same-circuit (`Verifier::verify_batch`) and cross-circuit (`BatchVerifier`) randomized batch verification using 129-bit GLV Pippenger on CPU and **GPU variable-base MSM** (`>= 2,048` dynamic points) with CPU/GPU overlap (**`69.1 ms` for 4,096 proofs = `16.9 µs/proof`**, **151× vs `master`**).
 
 ## Performance
 
@@ -42,11 +42,15 @@ Measured on an **Intel Core Ultra 9 275HX** (22 cores) + **NVIDIA GeForce RTX 50
 | **Prove `2^14` (16,384 gates)** | `647.6 ms` | `120.1 ms` *(min `119.2 ms`)* | **`33.9 ms`** *(min `33.1 ms`)* | **19.1×** |
 | **Prove `2^15` (32,768 gates)** | `1,074.7 ms` | `231.4 ms` *(min `218.5 ms`)* | **`59.7 ms`** *(min `55.9 ms`)* | **18.0×** |
 | **Prove `2^16` (65,536 gates)** | `2,073.6 ms` | `441.0 ms` *(min `418.9 ms`)* | **`90.6 ms`** *(min `90.6 ms`)* | **22.9×** |
-| **`Proof::from_bytes`** | `~870 µs` | **`208 µs`** | **`207 µs`** | **4.2×** |
-| **Verify single (32 PI)** | `~2,550 µs` | **`942 µs`** *(~800 µs quiet)* | **`837 µs`** | **3.0×** |
-| **Verify batch 16 (32 PI)** | `~40.8 ms` *(16× single)* | **`2.34 ms`** (`146 µs/proof`) | **`2.20 ms`** (`138 µs/proof`) | **18.5×** |
-| **Verify batch 32 (32 PI)** | `~81.6 ms` *(32× single)* | **`2.86 ms`** (`89 µs/proof`) | **`2.75 ms`** (`86 µs/proof`) | **29.7×** |
-| **Verify batch 64 (32 PI)** | `~163.2 ms` *(64× single)* | **`4.01 ms`** (`63 µs/proof`) | **`3.92 ms`** (`61 µs/proof`) | **41.6×** |
+| **`Proof::from_bytes` (single)** | `~870 µs` | **`208 µs`** | **`208 µs`** | **4.2×** |
+| **`Proof::from_bytes_batch` 256** | `~222.7 ms` *(256×)* | `12.8 ms` (`49.9 µs/p`) | **`4.15 ms`** (`16.2 µs/p`) | **53.7×** |
+| **`Proof::from_bytes_batch` 1,024** | `~890.9 ms` *(1024×)* | `47.3 ms` (`46.2 µs/p`) | **`10.6 ms`** (`10.3 µs/p`) | **84.0×** |
+| **`Proof::from_bytes_batch` 4,096** | `~3,563.5 ms` *(4096×)* | `187.5 ms` (`45.8 µs/p`) | **`23.7 ms`** (`5.8 µs/p`) | **150.4×** |
+| **Verify single (32 PI)** | `~2,550 µs` | **`715 µs`** | **`715 µs`** | **3.6×** |
+| **Verify batch 64 (32 PI)** | `~163.2 ms` *(64×)* | **`4.01 ms`** (`62.6 µs/p`) | **`4.01 ms`** (`62.6 µs/p`) | **40.7×** |
+| **Verify batch 256 (32 PI)** | `~652.8 ms` *(256×)* | `11.6 ms` (`45.1 µs/p`) | **`8.69 ms`** (`33.9 µs/p`) | **75.1×** |
+| **Verify batch 1,024 (32 PI)** | `~2,611.2 ms` *(1024×)* | `31.5 ms` (`30.7 µs/p`) | **`21.9 ms`** (`21.4 µs/p`) | **119.2×** |
+| **Verify batch 4,096 (32 PI)** | `~10,444.8 ms` *(4096×)* | `110.2 ms` (`26.9 µs/p`) | **`69.1 ms`** (`16.9 µs/p`) | **151.2×** |
 
 Run the end-to-end profiler yourself:
 

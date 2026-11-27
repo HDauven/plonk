@@ -189,24 +189,59 @@ fn main() {
         median(ver_samples)
     );
 
-    for k in [16usize, 32, 64] {
-        let items: Vec<(&Proof, &[BlsScalar])> = pairs[..k]
-            .iter()
-            .map(|(p, pi)| (p, pi.as_slice()))
+    for k in [16usize, 32, 64, 256, 1024, 4096] {
+        let items: Vec<(&Proof, &[BlsScalar])> = (0..k)
+            .map(|i| {
+                let (p, pi) = &pairs[i % pairs.len()];
+                (p, pi.as_slice())
+            })
             .collect();
         verifier_v.verify_batch(&items).unwrap();
 
+        let inner_iters = if k <= 64 {
+            10
+        } else if k <= 256 {
+            5
+        } else {
+            3
+        };
+        let outer_iters = if k <= 1024 { 7 } else { 5 };
         let mut samples = Vec::new();
-        for _ in 0..9 {
+        for _ in 0..outer_iters {
             let t0 = Instant::now();
-            for _ in 0..10 {
+            for _ in 0..inner_iters {
                 verifier_v.verify_batch(black_box(&items)).unwrap();
             }
-            samples.push(t0.elapsed().as_secs_f64() * 1e3 / 10.0);
+            samples.push(t0.elapsed().as_secs_f64() * 1e3 / inner_iters as f64);
         }
         let med = median(samples);
         println!(
-            "Verify batch {k:2} (32 PI):      median = {:8.2} ms  ({:6.1} us/proof)",
+            "Verify batch {k:4} (32 PI):    median = {:8.2} ms  ({:6.1} us/proof)",
+            med,
+            med * 1e3 / k as f64
+        );
+    }
+
+    for k in [64usize, 256, 1024, 4096] {
+        let batch_bytes: Vec<[u8; Proof::SIZE]> = (0..k)
+            .map(|i| pairs[i % pairs.len()].0.to_bytes())
+            .collect();
+        let _ = Proof::from_bytes_batch(&batch_bytes).unwrap();
+
+        let inner_iters = if k <= 256 { 5 } else { 3 };
+        let mut samples = Vec::new();
+        for _ in 0..7 {
+            let t0 = Instant::now();
+            for _ in 0..inner_iters {
+                let decoded =
+                    Proof::from_bytes_batch(black_box(&batch_bytes)).unwrap();
+                black_box(decoded);
+            }
+            samples.push(t0.elapsed().as_secs_f64() * 1e3 / inner_iters as f64);
+        }
+        let med = median(samples);
+        println!(
+            "from_bytes_batch {k:4}:        median = {:8.2} ms  ({:6.1} us/proof)",
             med,
             med * 1e3 / k as f64
         );

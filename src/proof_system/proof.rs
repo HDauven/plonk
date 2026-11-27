@@ -231,6 +231,98 @@ impl Proof {
             })?;
         Self::from_bytes(exact)
     }
+
+    /// Decodes a batch of serialized [`Proof`]s (each exactly [`Proof::SIZE`]
+    /// bytes), validating all 11 compressed BLS12-381 G1 commitments (including
+    /// prime-order subgroup checks) and all 15 field evaluations per proof.
+    ///
+    /// With `gpu-cuda` enabled and a CUDA GPU available, batches of `>= 96`
+    /// proofs offload G1 decompression and subgroup verification to the GPU
+    /// while decoding field evaluations concurrently on the CPU; otherwise uses
+    /// multi-threaded `blst` / CPU decoding.
+    #[cfg(feature = "alloc")]
+    pub fn from_bytes_batch(
+        proofs: &[[u8; Self::SIZE]],
+    ) -> Result<::alloc::vec::Vec<Self>, dusk_bytes::Error> {
+        if proofs.is_empty() {
+            return Ok(::alloc::vec::Vec::new());
+        }
+
+        #[cfg(feature = "gpu-cuda")]
+        if proofs.len() >= 96 {
+            use rayon::prelude::*;
+
+            const COMMS_PER_PROOF: usize = 11;
+            const COMM_BYTES: usize = COMMS_PER_PROOF * Commitment::SIZE;
+            let count = proofs.len();
+            let mut flat_comms =
+                ::alloc::vec![[0u8; Commitment::SIZE]; count * COMMS_PER_PROOF];
+            flat_comms
+                .par_chunks_exact_mut(COMMS_PER_PROOF)
+                .zip(proofs.par_iter())
+                .for_each(|(dst, raw)| {
+                    for (j, slot) in dst.iter_mut().enumerate() {
+                        slot.copy_from_slice(
+                            &raw[j * Commitment::SIZE
+                                ..(j + 1) * Commitment::SIZE],
+                        );
+                    }
+                });
+
+            if let Some(gpu_res) =
+                crate::gpu_cuda::decode_g1_compressed_batch_gpu_with_overlap(
+                    &flat_comms,
+                    || {
+                        proofs
+                            .par_iter()
+                            .map(|raw| {
+                                let mut ev = &raw[COMM_BYTES..];
+                                ProofEvaluations::from_reader(&mut ev)
+                            })
+                            .collect::<Result<
+                                ::alloc::vec::Vec<ProofEvaluations>,
+                                dusk_bytes::Error,
+                            >>()
+                    },
+                )
+            {
+                let (pts, evals_res) = gpu_res?;
+                let evals = evals_res?;
+                let out = pts
+                    .as_chunks::<COMMS_PER_PROOF>()
+                    .0
+                    .iter()
+                    .zip(evals)
+                    .map(|(c, evaluations)| Proof {
+                        a_comm: Commitment::from(c[0]),
+                        b_comm: Commitment::from(c[1]),
+                        c_comm: Commitment::from(c[2]),
+                        d_comm: Commitment::from(c[3]),
+                        z_comm: Commitment::from(c[4]),
+                        t_low_comm: Commitment::from(c[5]),
+                        t_mid_comm: Commitment::from(c[6]),
+                        t_high_comm: Commitment::from(c[7]),
+                        t_fourth_comm: Commitment::from(c[8]),
+                        w_z_chall_comm: Commitment::from(c[9]),
+                        w_z_chall_w_comm: Commitment::from(c[10]),
+                        evaluations,
+                    })
+                    .collect();
+                return Ok(out);
+            }
+        }
+
+        #[cfg(feature = "std")]
+        {
+            use rayon::prelude::*;
+
+            if proofs.len() >= 4 && rayon::current_num_threads() > 1 {
+                return proofs.par_iter().map(Self::from_bytes).collect();
+            }
+        }
+
+        proofs.iter().map(Self::from_bytes).collect()
+    }
 }
 
 #[cfg(feature = "alloc")]
