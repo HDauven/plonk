@@ -72,6 +72,10 @@ pub(crate) struct FastProverCache {
     omega_8_inv_3: FastFr,
     gen_inv_t_scaled: Vec<FastFr>,
     gen_inv_sn: [FastFr; 8],
+    #[cfg(feature = "gpu-cuda")]
+    gpu_ntt: std::sync::Arc<
+        std::sync::OnceLock<Option<crate::gpu_cuda::GpuNttTables>>,
+    >,
 }
 
 #[inline]
@@ -284,7 +288,35 @@ impl FastProverCache {
             omega_8_inv_3,
             gen_inv_t_scaled,
             gen_inv_sn,
+            #[cfg(feature = "gpu-cuda")]
+            gpu_ntt: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    #[cfg(feature = "gpu-cuda")]
+    fn gpu_ntt_tables(
+        &self,
+        n: usize,
+        log_n: u32,
+    ) -> Option<&crate::gpu_cuda::GpuNttTables> {
+        self.gpu_ntt
+            .get_or_init(|| {
+                let coset_powers: [&[FastFr]; 8] = core::array::from_fn(|k| {
+                    self.cosets[k].coset_powers.as_slice()
+                });
+                let ck_pown: [FastFr; 8] =
+                    core::array::from_fn(|k| self.cosets[k].c_k_pow_n);
+                crate::gpu_cuda::GpuNttTables::upload(
+                    n,
+                    log_n,
+                    &self.domain_fft_roots,
+                    &self.domain_ifft_roots,
+                    self.domain_size_inv,
+                    coset_powers,
+                    ck_pown,
+                )
+            })
+            .as_ref()
     }
 
     /// Compute the split quotient polynomial chunks `(t_low, t_mid, t_high,
@@ -335,26 +367,6 @@ impl FastProverCache {
                 &pi_poly[..],
             ];
 
-            // Flat parallel batch of 20 (or 24) L2-hot n-point coset FFTs!
-            let wave_evals: Vec<Vec<FastFr>> = (0..total_ffts)
-                .into_par_iter()
-                .map(|idx| {
-                    let local_k = idx / polys_per_coset;
-                    let p_idx = idx % polys_per_coset;
-                    let coset = &self.cosets[k_base + local_k];
-                    coset_n_fft_fast(
-                        src_polys[p_idx],
-                        n,
-                        log_n,
-                        coset.c_k_pow_n,
-                        &coset.coset_powers,
-                        &self.domain_fft_roots,
-                    )
-                })
-                .collect();
-
-            // Evaluate the quotient polynomial on all 4 cosets in parallel
-            // chunks across all cores.
             let mut q_evals: [Vec<FastFr>; 4] =
                 core::array::from_fn(|_| vec![FastFr::ZERO; n]);
 
@@ -370,31 +382,110 @@ impl FastProverCache {
                 }
             }
 
-            out_chunks
-                .into_par_iter()
-                .for_each(|(local_k, start, out)| {
-                    let coset = &self.cosets[k_base + local_k];
-                    let base = local_k * polys_per_coset;
-                    let z_ev = &wave_evals[base];
-                    let a_ev = &wave_evals[base + 1];
-                    let b_ev = &wave_evals[base + 2];
-                    let c_ev = &wave_evals[base + 3];
-                    let d_ev = &wave_evals[base + 4];
-                    let pi_ev = has_pi.then(|| wave_evals[base + 5].as_slice());
-                    eval_quotient_chunk(
-                        coset, &ch, z_ev, a_ev, b_ev, c_ev, d_ev, pi_ev, start,
-                        out,
-                    );
-                });
+            // Flat parallel batch of 20 (or 24) n-point coset FFTs (zero-copy
+            // pinned GPU DMA when `gpu-cuda` is enabled and `n >= GPU_NTT_MIN_LEN`,
+            // else L2-hot CPU).
+            #[cfg(feature = "gpu-cuda")]
+            let gpu_done = self
+                .gpu_ntt_tables(n, log_n)
+                .and_then(|gpu| {
+                    gpu.with_coset_ffts_wave(
+                        k_base,
+                        &src_polys[..polys_per_coset],
+                        |flat| {
+                            out_chunks.par_iter_mut().for_each(
+                                |(local_k, start, out)| {
+                                    let coset = &self.cosets[k_base + *local_k];
+                                    let base = *local_k * polys_per_coset;
+                                    let z_ev = &flat[base * n..(base + 1) * n];
+                                    let a_ev =
+                                        &flat[(base + 1) * n..(base + 2) * n];
+                                    let b_ev =
+                                        &flat[(base + 2) * n..(base + 3) * n];
+                                    let c_ev =
+                                        &flat[(base + 3) * n..(base + 4) * n];
+                                    let d_ev =
+                                        &flat[(base + 4) * n..(base + 5) * n];
+                                    let pi_ev = has_pi.then(|| {
+                                        &flat[(base + 5) * n..(base + 6) * n]
+                                    });
+                                    eval_quotient_chunk(
+                                        coset, &ch, z_ev, a_ev, b_ev, c_ev,
+                                        d_ev, pi_ev, *start, out,
+                                    );
+                                },
+                            );
+                        },
+                    )
+                })
+                .is_some();
 
-            drop(wave_evals);
+            #[cfg(not(feature = "gpu-cuda"))]
+            let gpu_done = false;
+
+            if !gpu_done {
+                let wave_evals: Vec<Vec<FastFr>> = (0..total_ffts)
+                    .into_par_iter()
+                    .map(|idx| {
+                        let local_k = idx / polys_per_coset;
+                        let p_idx = idx % polys_per_coset;
+                        let coset = &self.cosets[k_base + local_k];
+                        coset_n_fft_fast(
+                            src_polys[p_idx],
+                            n,
+                            log_n,
+                            coset.c_k_pow_n,
+                            &coset.coset_powers,
+                            &self.domain_fft_roots,
+                        )
+                    })
+                    .collect();
+
+                out_chunks
+                    .into_par_iter()
+                    .for_each(|(local_k, start, out)| {
+                        let coset = &self.cosets[k_base + local_k];
+                        let base = local_k * polys_per_coset;
+                        let z_ev = &wave_evals[base];
+                        let a_ev = &wave_evals[base + 1];
+                        let b_ev = &wave_evals[base + 2];
+                        let c_ev = &wave_evals[base + 3];
+                        let d_ev = &wave_evals[base + 4];
+                        let pi_ev =
+                            has_pi.then(|| wave_evals[base + 5].as_slice());
+                        eval_quotient_chunk(
+                            coset, &ch, z_ev, a_ev, b_ev, c_ev, d_ev, pi_ev,
+                            start, out,
+                        );
+                    });
+            }
 
             for (offset, q_ev) in q_evals.into_iter().enumerate() {
                 q_evals_all[k_base + offset] = q_ev;
             }
         }
 
-        // Run all 8 n-point IFFTs concurrently across cores.
+        // Run all 8 n-point IFFTs concurrently (GPU when `gpu-cuda` is enabled
+        // and `n >= GPU_NTT_MIN_LEN`, else CPU across cores).
+        #[cfg(feature = "gpu-cuda")]
+        let coset_iffts_vec: Vec<Vec<FastFr>> = self
+            .gpu_ntt_tables(n, log_n)
+            .and_then(|gpu| gpu.batch_ifft(&q_evals_all))
+            .unwrap_or_else(|| {
+                q_evals_all
+                    .into_par_iter()
+                    .map(|q_ev| {
+                        serial_ifft_fast(
+                            &q_ev,
+                            &self.domain_ifft_roots,
+                            self.domain_size_inv,
+                            log_n,
+                        )
+                    })
+                    .collect()
+            });
+
+        #[cfg(not(feature = "gpu-cuda"))]
         let coset_iffts_vec: Vec<Vec<FastFr>> = q_evals_all
             .into_par_iter()
             .map(|q_ev| {

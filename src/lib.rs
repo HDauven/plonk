@@ -79,6 +79,8 @@ pub(crate) mod debugger;
 pub(crate) mod fast_fr;
 #[cfg(feature = "std")]
 pub(crate) mod fast_quotient;
+#[cfg(feature = "gpu-cuda")]
+pub(crate) mod gpu_cuda;
 
 #[cfg(feature = "rkyv-impl")]
 mod archive;

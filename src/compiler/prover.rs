@@ -39,6 +39,10 @@ pub struct Prover {
     #[cfg(feature = "blst-backend")]
     blst_lagrange_powers:
         alloc::sync::Arc<std::sync::OnceLock<Vec<blst::blst_p1_affine>>>,
+    #[cfg(feature = "gpu-cuda")]
+    gpu_bases: alloc::sync::Arc<
+        std::sync::OnceLock<Option<crate::gpu_cuda::GpuCommitBases>>,
+    >,
     pub(crate) verifier_key: VerifierKey,
     pub(crate) transcript: Transcript,
     sigma_evaluations: [Vec<BlsScalar>; 4],
@@ -148,6 +152,8 @@ impl Prover {
             blst_powers,
             #[cfg(feature = "blst-backend")]
             blst_lagrange_powers,
+            #[cfg(feature = "gpu-cuda")]
+            gpu_bases: alloc::sync::Arc::new(std::sync::OnceLock::new()),
             verifier_key,
             transcript,
             sigma_evaluations,
@@ -288,6 +294,15 @@ impl Prover {
         core::array::from_fn(|i| targets[i].0.evaluate(&targets[i].1))
     }
 
+    #[cfg(feature = "gpu-cuda")]
+    fn gpu_commit_bases(&self) -> Option<&crate::gpu_cuda::GpuCommitBases> {
+        self.gpu_bases
+            .get_or_init(|| {
+                crate::gpu_cuda::GpuCommitBases::upload(&self.blst_powers)
+            })
+            .as_ref()
+    }
+
     fn commit_one(&self, polynomial: &Polynomial) -> Result<Commitment, Error> {
         #[cfg(feature = "blst-backend")]
         {
@@ -295,6 +310,13 @@ impl Prover {
                 || polynomial.len() > self.blst_powers.len()
             {
                 return Err(Error::PolynomialDegreeTooLarge);
+            }
+            #[cfg(feature = "gpu-cuda")]
+            if polynomial.len() >= crate::gpu_cuda::GPU_MSM_MIN_LEN
+                && let Some(gpu) = self.gpu_commit_bases()
+                && let Some([affine]) = gpu.msm_batch([&polynomial[..]])
+            {
+                return Ok(Commitment::from(affine));
             }
             Ok(Commitment::from(crate::blst_backend::msm_g1(
                 &self.blst_powers,
@@ -321,6 +343,15 @@ impl Prover {
                 }
             }
             let raw = polynomials.map(|p| &p[..]);
+            #[cfg(feature = "gpu-cuda")]
+            if raw
+                .iter()
+                .any(|p| p.len() >= crate::gpu_cuda::GPU_MSM_MIN_LEN)
+                && let Some(gpu) = self.gpu_commit_bases()
+                && let Some(affines) = gpu.msm_batch(raw)
+            {
+                return Ok(affines.map(Commitment::from));
+            }
             let affines =
                 crate::blst_backend::msm_g1_batch(&self.blst_powers, raw);
             Ok(affines.map(Commitment::from))
@@ -756,7 +787,14 @@ impl Prover {
         // ([a(x)]_1, [b(x)]_1, [c(x)]_1, [d(x)]_1)
         #[cfg(feature = "blst-backend")]
         let [a_comm, b_comm, c_comm, d_comm] = {
-            if size + 3 <= self.blst_powers.len()
+            #[cfg(feature = "gpu-cuda")]
+            let use_gpu_wires = size >= crate::gpu_cuda::GPU_MSM_MIN_LEN
+                && crate::gpu_cuda::is_gpu_available();
+            #[cfg(not(feature = "gpu-cuda"))]
+            let use_gpu_wires = false;
+
+            if !use_gpu_wires
+                && size + 3 <= self.blst_powers.len()
                 && a_poly.degree() <= self.commit_key.max_degree()
                 && b_poly.degree() <= self.commit_key.max_degree()
                 && c_poly.degree() <= self.commit_key.max_degree()
