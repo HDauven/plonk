@@ -72,6 +72,10 @@ pub(crate) struct FastProverCache {
     omega_8_inv_3: FastFr,
     gen_inv_t_scaled: Vec<FastFr>,
     gen_inv_sn: [FastFr; 8],
+    #[cfg(feature = "gpu-cuda")]
+    gpu_ntt: std::sync::Arc<
+        std::sync::OnceLock<Option<crate::gpu_cuda::GpuNttTables>>,
+    >,
 }
 
 #[inline]
@@ -284,7 +288,233 @@ impl FastProverCache {
             omega_8_inv_3,
             gen_inv_t_scaled,
             gen_inv_sn,
+            #[cfg(feature = "gpu-cuda")]
+            gpu_ntt: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    #[cfg(feature = "gpu-cuda")]
+    fn gpu_ntt_tables(
+        &self,
+        n: usize,
+        log_n: u32,
+    ) -> Option<&crate::gpu_cuda::GpuNttTables> {
+        self.gpu_ntt
+            .get_or_init(|| {
+                let coset_powers: [&[FastFr]; 8] = core::array::from_fn(|k| {
+                    self.cosets[k].coset_powers.as_slice()
+                });
+                let ck_pown: [FastFr; 8] =
+                    core::array::from_fn(|k| self.cosets[k].c_k_pow_n);
+                let vanishing_inv: [FastFr; 8] =
+                    core::array::from_fn(|k| self.cosets[k].vanishing_inv);
+                let opt_sel =
+                    |f: fn(&CosetData) -> Option<&[FastFr]>| -> Option<[Option<&[FastFr]>; 8]> {
+                        let arr: [Option<&[FastFr]>; 8] =
+                            core::array::from_fn(|k| f(&self.cosets[k]));
+                        arr.iter().any(Option::is_some).then_some(arr)
+                    };
+                let req_sel =
+                    |f: fn(&CosetData) -> &[FastFr]| -> Option<[Option<&[FastFr]>; 8]> {
+                        Some(core::array::from_fn(|k| Some(f(&self.cosets[k]))))
+                    };
+                let selectors: [Option<[Option<&[FastFr]>; 8]>; 17] = [
+                    req_sel(|c| &c.q_m),
+                    req_sel(|c| &c.q_l),
+                    req_sel(|c| &c.q_r),
+                    req_sel(|c| &c.q_o),
+                    req_sel(|c| &c.q_f),
+                    req_sel(|c| &c.q_c),
+                    req_sel(|c| &c.q_arith),
+                    opt_sel(|c| c.q_range.as_deref()),
+                    opt_sel(|c| c.q_logic.as_deref()),
+                    opt_sel(|c| c.q_fixed.as_deref()),
+                    opt_sel(|c| c.q_var.as_deref()),
+                    req_sel(|c| &c.s_sigma_1),
+                    req_sel(|c| &c.s_sigma_2),
+                    req_sel(|c| &c.s_sigma_3),
+                    req_sel(|c| &c.s_sigma_4),
+                    req_sel(|c| &c.linear_evals),
+                    req_sel(|c| &c.l1_evals),
+                ];
+                let inv_twiddles: [&[FastFr]; 7] = core::array::from_fn(|i| {
+                    self.cosets[i + 1].inv_twiddle.as_slice()
+                });
+                let combine_consts = [
+                    self.omega_8_inv_1,
+                    self.omega_8_inv_2,
+                    self.omega_8_inv_3,
+                    self.gen_inv_sn[0],
+                    self.gen_inv_sn[1],
+                    self.gen_inv_sn[2],
+                    self.gen_inv_sn[3],
+                    self.gen_inv_sn[4],
+                    self.gen_inv_sn[5],
+                    self.gen_inv_sn[6],
+                ];
+                crate::gpu_cuda::GpuNttTables::upload(
+                    n,
+                    log_n,
+                    &self.domain_fft_roots,
+                    &self.domain_ifft_roots,
+                    self.domain_size_inv,
+                    coset_powers,
+                    ck_pown,
+                    vanishing_inv,
+                    inv_twiddles,
+                    &self.gen_inv_t_scaled,
+                    combine_consts,
+                    selectors,
+                )
+            })
+            .as_ref()
+    }
+
+    #[cfg(feature = "gpu-cuda")]
+    pub(crate) fn with_ifft_batch_fast_fr<const K: usize, F, R>(
+        &self,
+        n: usize,
+        log_n: u32,
+        inputs: [&[BlsScalar]; K],
+        f: F,
+    ) -> Option<R>
+    where
+        F: FnOnce(&mut [FastFr]) -> Option<R>,
+    {
+        self.gpu_ntt_tables(n, log_n)?
+            .with_ifft_batch_fast_fr(inputs, f)
+    }
+
+    #[cfg(feature = "gpu-cuda")]
+    pub(crate) fn ifft_batch_gpu<const K: usize>(
+        &self,
+        n: usize,
+        log_n: u32,
+        inputs: [&[BlsScalar]; K],
+        extra_cap: usize,
+    ) -> Option<[Vec<BlsScalar>; K]> {
+        self.gpu_ntt_tables(n, log_n)?.ifft_batch(inputs, extra_cap)
+    }
+
+    /// Fused GPU quotient + blinding + commitment path overlapping
+    /// `FastFr -> BlsScalar` conversion on CPU while GPU runs `quot_msm`.
+    #[cfg(feature = "gpu-cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn compute_and_commit_split_quotient_gpu(
+        &self,
+        domain: &EvaluationDomain,
+        z_poly: &Polynomial,
+        (a_poly, b_poly, c_poly, d_poly): (
+            &Polynomial,
+            &Polynomial,
+            &Polynomial,
+            &Polynomial,
+        ),
+        pi_poly: &Polynomial,
+        challenges: &(
+            BlsScalar,
+            BlsScalar,
+            BlsScalar,
+            BlsScalar,
+            BlsScalar,
+            BlsScalar,
+            BlsScalar,
+        ),
+        blinders: [BlsScalar; 3],
+        gpu_bases: &crate::gpu_cuda::GpuCommitBases,
+        max_degree: usize,
+    ) -> Option<Result<crate::gpu_cuda::SplitQuotientWithComms, Error>> {
+        let n = domain.size();
+        let log_n = domain.log_size_of_group;
+        let has_pi = !pi_poly.is_zero();
+        let polys_per_coset = if has_pi { 6usize } else { 5usize };
+        let src_polys: [&[BlsScalar]; 6] = [
+            &z_poly[..],
+            &a_poly[..],
+            &b_poly[..],
+            &c_poly[..],
+            &d_poly[..],
+            &pi_poly[..],
+        ];
+        let ch = QuotientFastChallenges::new(challenges);
+        let gpu = self.gpu_ntt_tables(n, log_n)?;
+        let gpu_ch = ch.to_gpu_array();
+        gpu.compute_and_commit_split_quotient_gpu(
+            &src_polys[..polys_per_coset],
+            &gpu_ch,
+            blinders,
+            gpu_bases,
+            max_degree,
+            |flat| {
+                let coset_iffts: [&[FastFr]; 8] =
+                    core::array::from_fn(|k| &flat[k * n..(k + 1) * n]);
+                self.finalize_radix8_combine(coset_iffts, n)
+            },
+        )
+    }
+
+    fn finalize_radix8_combine(
+        &self,
+        coset_iffts: [&[FastFr]; 8],
+        n: usize,
+    ) -> Result<[Vec<BlsScalar>; 4], Error> {
+        let mut t_low = vec![BlsScalar::zero(); n];
+        let mut t_mid = vec![BlsScalar::zero(); n];
+        let mut t_high = vec![BlsScalar::zero(); n];
+        let mut t_fourth = vec![BlsScalar::zero(); n];
+        let unsatisfied = AtomicBool::new(false);
+
+        const COMBINE_CHUNK: usize = 512;
+        let slices: Vec<_> = t_low
+            .chunks_mut(COMBINE_CHUNK)
+            .zip(t_mid.chunks_mut(COMBINE_CHUNK))
+            .zip(t_high.chunks_mut(COMBINE_CHUNK))
+            .zip(t_fourth.chunks_mut(COMBINE_CHUNK))
+            .enumerate()
+            .collect();
+
+        let extra_tails: Vec<Vec<(usize, BlsScalar)>> = slices
+            .into_par_iter()
+            .map(|(chunk_idx, (((c0, c1), c2), c3))| {
+                let start = chunk_idx * COMBINE_CHUNK;
+                combine_radix8_chunk(
+                    self,
+                    coset_iffts,
+                    n,
+                    start,
+                    [c0, c1, c2, c3],
+                    &unsatisfied,
+                )
+            })
+            .collect();
+
+        if unsatisfied.load(Ordering::Relaxed) {
+            return Err(Error::CircuitUnsatisfied);
+        }
+
+        let max_tail_idx = extra_tails
+            .iter()
+            .flat_map(|v| v.iter().map(|&(idx, _)| idx))
+            .max();
+        if let Some(max_idx) = max_tail_idx {
+            t_fourth.resize(n + max_idx + 1, BlsScalar::zero());
+            for tail in extra_tails {
+                for (idx, val) in tail {
+                    t_fourth[n + idx] = val;
+                }
+            }
+        } else {
+            let mut l = t_fourth.len();
+            while l > 0 && t_fourth[l - 1] == BlsScalar::zero() {
+                l -= 1;
+            }
+            t_fourth.truncate(l);
+        }
+        if t_fourth.is_empty() {
+            t_fourth.push(BlsScalar::zero());
+        }
+
+        Ok([t_low, t_mid, t_high, t_fourth])
     }
 
     /// Compute the split quotient polynomial chunks `(t_low, t_mid, t_high,
@@ -314,28 +544,48 @@ impl FastProverCache {
         let n = domain.size();
         let log_n = domain.log_size_of_group;
         let has_pi = !pi_poly.is_zero();
+        let polys_per_coset = if has_pi { 6usize } else { 5usize };
+        let src_polys: [&[BlsScalar]; 6] = [
+            &z_poly[..],
+            &a_poly[..],
+            &b_poly[..],
+            &c_poly[..],
+            &d_poly[..],
+            &pi_poly[..],
+        ];
 
         let ch = QuotientFastChallenges::new(challenges);
 
-        // Process the 8 cosets in 2 waves of 4 cosets each to halve peak
-        // memory while keeping 20-24 independent n-point FFTs saturating all
-        // cores per wave, then run all 8 n-point IFFTs in one parallel pass.
+        // Full GPU VRAM path: upload 5 (or 6) source polynomials once, run all
+        // 40 forward coset NTTs + 524K pointwise widget evaluations + 8 inverse
+        // coset IFFTs + radix-8 combine in VRAM, and download only `4 * n + 16`
+        // coefficients (`8 MB` at `2^16`).
+        #[cfg(feature = "gpu-cuda")]
+        if let Some(gpu) = self.gpu_ntt_tables(n, log_n) {
+            let gpu_ch = ch.to_gpu_array();
+            if let Some(res) = gpu.compute_split_quotient_gpu(
+                &src_polys[..polys_per_coset],
+                &gpu_ch,
+                |flat| {
+                    let coset_iffts: [&[FastFr]; 8] =
+                        core::array::from_fn(|k| &flat[k * n..(k + 1) * n]);
+                    self.finalize_radix8_combine(coset_iffts, n)
+                },
+            ) {
+                return res;
+            }
+        }
+
+        // CPU fallback: process the 8 cosets in 2 waves of 4 cosets each to
+        // halve peak memory while keeping 20-24 independent n-point FFTs
+        // saturating all cores per wave, then run all 8 n-point IFFTs in one
+        // parallel pass.
         let mut q_evals_all: [Vec<FastFr>; 8] = Default::default();
 
         for wave in 0..2usize {
             let k_base = wave * 4;
-            let polys_per_coset = if has_pi { 6usize } else { 5usize };
             let total_ffts = 4 * polys_per_coset;
-            let src_polys: [&[BlsScalar]; 6] = [
-                &z_poly[..],
-                &a_poly[..],
-                &b_poly[..],
-                &c_poly[..],
-                &d_poly[..],
-                &pi_poly[..],
-            ];
 
-            // Flat parallel batch of 20 (or 24) L2-hot n-point coset FFTs!
             let wave_evals: Vec<Vec<FastFr>> = (0..total_ffts)
                 .into_par_iter()
                 .map(|idx| {
@@ -353,8 +603,6 @@ impl FastProverCache {
                 })
                 .collect();
 
-            // Evaluate the quotient polynomial on all 4 cosets in parallel
-            // chunks across all cores.
             let mut q_evals: [Vec<FastFr>; 4] =
                 core::array::from_fn(|_| vec![FastFr::ZERO; n]);
 
@@ -387,14 +635,11 @@ impl FastProverCache {
                     );
                 });
 
-            drop(wave_evals);
-
             for (offset, q_ev) in q_evals.into_iter().enumerate() {
                 q_evals_all[k_base + offset] = q_ev;
             }
         }
 
-        // Run all 8 n-point IFFTs concurrently across cores.
         let coset_iffts_vec: Vec<Vec<FastFr>> = q_evals_all
             .into_par_iter()
             .map(|q_ev| {
@@ -406,72 +651,142 @@ impl FastProverCache {
                 )
             })
             .collect();
-        let coset_iffts: [Vec<FastFr>; 8] =
-            coset_iffts_vec.try_into().expect("8 cosets");
+        let coset_iffts: [&[FastFr]; 8] =
+            core::array::from_fn(|k| coset_iffts_vec[k].as_slice());
 
-        // Radix-8 inverse combine over `t in 0..n` directly into
-        // `(t_low, t_mid, t_high, t_fourth_0..n)` plus sparse tail `4n..7n`
-        // and `7n..8n` unsatisfied-circuit check!
-        let mut t_low = vec![BlsScalar::zero(); n];
-        let mut t_mid = vec![BlsScalar::zero(); n];
-        let mut t_high = vec![BlsScalar::zero(); n];
-        let mut t_fourth = vec![BlsScalar::zero(); n];
-        let unsatisfied = AtomicBool::new(false);
+        self.finalize_radix8_combine(coset_iffts, n)
+    }
 
-        const COMBINE_CHUNK: usize = 512;
-        let slices: Vec<_> = t_low
-            .chunks_mut(COMBINE_CHUNK)
-            .zip(t_mid.chunks_mut(COMBINE_CHUNK))
-            .zip(t_high.chunks_mut(COMBINE_CHUNK))
-            .zip(t_fourth.chunks_mut(COMBINE_CHUNK))
-            .enumerate()
-            .collect();
+    #[cfg(all(test, feature = "gpu-cuda"))]
+    pub(crate) fn compute_split_quotient_raw_iffts_gpu(
+        &self,
+        domain: &EvaluationDomain,
+        z_poly: &Polynomial,
+        (a_poly, b_poly, c_poly, d_poly): (
+            &Polynomial,
+            &Polynomial,
+            &Polynomial,
+            &Polynomial,
+        ),
+        pi_poly: &Polynomial,
+        challenges: &(
+            BlsScalar,
+            BlsScalar,
+            BlsScalar,
+            BlsScalar,
+            BlsScalar,
+            BlsScalar,
+            BlsScalar,
+        ),
+    ) -> [Vec<FastFr>; 8] {
+        let n = domain.size();
+        let log_n = domain.log_size_of_group;
+        let has_pi = !pi_poly.is_zero();
+        let polys_per_coset = if has_pi { 6usize } else { 5usize };
+        let src_polys: [&[BlsScalar]; 6] = [
+            &z_poly[..],
+            &a_poly[..],
+            &b_poly[..],
+            &c_poly[..],
+            &d_poly[..],
+            &pi_poly[..],
+        ];
+        let ch = QuotientFastChallenges::new(challenges);
+        let gpu_ch = ch.to_gpu_array();
+        let gpu = self
+            .gpu_ntt_tables(n, log_n)
+            .expect("GPU NTT tables should initialize");
+        gpu.with_full_quotient_iffts(
+            &src_polys[..polys_per_coset],
+            &gpu_ch,
+            |flat| core::array::from_fn(|k| flat[k * n..(k + 1) * n].to_vec()),
+        )
+        .expect("GPU full quotient should succeed")
+    }
 
-        let extra_tails: Vec<Vec<(usize, BlsScalar)>> = slices
-            .into_par_iter()
-            .map(|(chunk_idx, (((c0, c1), c2), c3))| {
-                let start = chunk_idx * COMBINE_CHUNK;
-                combine_radix8_chunk(
-                    self,
-                    &coset_iffts,
-                    n,
-                    start,
-                    [c0, c1, c2, c3],
-                    &unsatisfied,
-                )
-            })
-            .collect();
-
-        if unsatisfied.load(Ordering::Relaxed) {
-            return Err(Error::CircuitUnsatisfied);
-        }
-
-        // Append any nonzero tail entries in `4n..7n` identically to
-        // `Polynomial::from_coefficients_vec(quotient)[3n..]`.
-        let max_tail_idx = extra_tails
-            .iter()
-            .flat_map(|v| v.iter().map(|&(idx, _)| idx))
-            .max();
-        if let Some(max_idx) = max_tail_idx {
-            t_fourth.resize(n + max_idx + 1, BlsScalar::zero());
-            for tail in extra_tails {
-                for (idx, val) in tail {
-                    t_fourth[n + idx] = val;
-                }
+    #[cfg(all(test, feature = "gpu-cuda"))]
+    pub(crate) fn compute_split_quotient_raw_iffts_cpu(
+        &self,
+        domain: &EvaluationDomain,
+        z_poly: &Polynomial,
+        (a_poly, b_poly, c_poly, d_poly): (
+            &Polynomial,
+            &Polynomial,
+            &Polynomial,
+            &Polynomial,
+        ),
+        pi_poly: &Polynomial,
+        challenges: &(
+            BlsScalar,
+            BlsScalar,
+            BlsScalar,
+            BlsScalar,
+            BlsScalar,
+            BlsScalar,
+            BlsScalar,
+        ),
+    ) -> [Vec<FastFr>; 8] {
+        let n = domain.size();
+        let log_n = domain.log_size_of_group;
+        let has_pi = !pi_poly.is_zero();
+        let polys_per_coset = if has_pi { 6usize } else { 5usize };
+        let src_polys: [&[BlsScalar]; 6] = [
+            &z_poly[..],
+            &a_poly[..],
+            &b_poly[..],
+            &c_poly[..],
+            &d_poly[..],
+            &pi_poly[..],
+        ];
+        let ch = QuotientFastChallenges::new(challenges);
+        let mut q_evals_all: [Vec<FastFr>; 8] = Default::default();
+        for wave in 0..2usize {
+            let k_base = wave * 4;
+            let total_ffts = 4 * polys_per_coset;
+            let wave_evals: Vec<Vec<FastFr>> = (0..total_ffts)
+                .into_par_iter()
+                .map(|idx| {
+                    let local_k = idx / polys_per_coset;
+                    let p_idx = idx % polys_per_coset;
+                    let coset = &self.cosets[k_base + local_k];
+                    coset_n_fft_fast(
+                        src_polys[p_idx],
+                        n,
+                        log_n,
+                        coset.c_k_pow_n,
+                        &coset.coset_powers,
+                        &self.domain_fft_roots,
+                    )
+                })
+                .collect();
+            for local_k in 0..4 {
+                let coset = &self.cosets[k_base + local_k];
+                let base = local_k * polys_per_coset;
+                let mut out = vec![FastFr::ZERO; n];
+                let pi_ev = has_pi.then(|| wave_evals[base + 5].as_slice());
+                eval_quotient_chunk(
+                    coset,
+                    &ch,
+                    &wave_evals[base],
+                    &wave_evals[base + 1],
+                    &wave_evals[base + 2],
+                    &wave_evals[base + 3],
+                    &wave_evals[base + 4],
+                    pi_ev,
+                    0,
+                    &mut out,
+                );
+                q_evals_all[k_base + local_k] = out;
             }
-        } else {
-            let mut l = t_fourth.len();
-            while l > 0 && t_fourth[l - 1] == BlsScalar::zero() {
-                l -= 1;
-            }
-            t_fourth.truncate(l);
         }
-        // `t_fourth_vec[0] -= b_14` requires at least 1 element.
-        if t_fourth.is_empty() {
-            t_fourth.push(BlsScalar::zero());
-        }
-
-        Ok([t_low, t_mid, t_high, t_fourth])
+        core::array::from_fn(|k| {
+            serial_ifft_fast(
+                &q_evals_all[k],
+                &self.domain_ifft_roots,
+                self.domain_size_inv,
+                log_n,
+            )
+        })
     }
 }
 
@@ -601,6 +916,48 @@ impl QuotientFastChallenges {
             var_k1: FastFr::from_bls(&vk1),
             var_k2: FastFr::from_bls(&vk2),
         }
+    }
+
+    #[cfg(feature = "gpu-cuda")]
+    fn to_gpu_array(self) -> [FastFr; 36] {
+        [
+            self.alpha,
+            self.alpha_sq,
+            self.beta,
+            self.beta_k1,
+            self.beta_k2,
+            self.beta_k3,
+            self.gamma,
+            self.inv_beta,
+            self.gamma_over_beta,
+            self.beta4_alpha,
+            self.k1,
+            self.k2,
+            self.k3,
+            FastFr::ONE,
+            self.two,
+            self.three,
+            self.range_ch,
+            self.range_k1,
+            self.range_k2,
+            self.range_k3,
+            self.logic_ch,
+            self.logic_k1,
+            self.logic_k2,
+            self.logic_k3,
+            self.logic_k4,
+            self.eighty_one,
+            self.eighty_three,
+            self.fixed_ch,
+            self.fixed_k1,
+            self.fixed_k2,
+            self.fixed_k3,
+            self.edwards_d,
+            self.var_ch,
+            self.var_k1,
+            self.var_k2,
+            FastFr([u64::from(self.has_inv_beta), 0, 0, 0]),
+        ]
     }
 }
 
@@ -925,7 +1282,7 @@ macro_rules! define_combine_radix8_kernel {
         $(#[$attrs])*
         fn $fn_name(
             cache: &FastProverCache,
-            coset_iffts: &[Vec<FastFr>; 8],
+            coset_iffts: [&[FastFr]; 8],
             n: usize,
             start: usize,
             outs: [&mut [BlsScalar]; 4],
@@ -1028,7 +1385,7 @@ define_combine_radix8_kernel!(
 
 fn combine_radix8_chunk(
     cache: &FastProverCache,
-    coset_iffts: &[Vec<FastFr>; 8],
+    coset_iffts: [&[FastFr]; 8],
     n: usize,
     start: usize,
     outs: [&mut [BlsScalar]; 4],

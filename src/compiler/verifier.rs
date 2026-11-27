@@ -384,39 +384,109 @@ impl Verifier {
         let mut merged_static = [BlsScalar::zero(); STATIC_POINT_COUNT];
         #[cfg(feature = "blst-backend")]
         {
-            let mut left_pts = Vec::with_capacity(2 * items.len());
-            let mut left_scs = Vec::with_capacity(2 * items.len());
+            let batch_len = items.len();
+            let mut left_pts = vec![G1Affine::identity(); 2 * batch_len];
+            let mut left_scs = vec![BlsScalar::zero(); 2 * batch_len];
             let mut right_dyn_pts =
-                Vec::with_capacity(DYNAMIC_POINT_COUNT * items.len());
+                vec![G1Affine::identity(); DYNAMIC_POINT_COUNT * batch_len];
             let mut right_dyn_scs =
-                Vec::with_capacity(DYNAMIC_POINT_COUNT * items.len());
+                vec![BlsScalar::zero(); DYNAMIC_POINT_COUNT * batch_len];
 
-            for (prep, &rho) in prepared.iter().zip(rhos.iter()) {
-                if rho == BlsScalar::one() {
-                    for (dst, src) in
-                        merged_static.iter_mut().zip(prep.static_scalars.iter())
-                    {
-                        *dst += *src;
-                    }
-                    left_pts.push(prep.w_z);
-                    left_scs.push(BlsScalar::one());
-                    left_pts.push(prep.w_zw);
-                    left_scs.push(prep.u_challenge);
-                    right_dyn_pts.extend_from_slice(&prep.dynamic_points);
-                    right_dyn_scs.extend_from_slice(&prep.dynamic_scalars);
-                } else {
-                    for (dst, src) in
-                        merged_static.iter_mut().zip(prep.static_scalars.iter())
-                    {
-                        *dst += rho * *src;
-                    }
-                    left_pts.push(prep.w_z);
-                    left_scs.push(rho);
-                    left_pts.push(prep.w_zw);
-                    left_scs.push(rho * prep.u_challenge);
-                    right_dyn_pts.extend_from_slice(&prep.dynamic_points);
-                    for sc in &prep.dynamic_scalars {
-                        right_dyn_scs.push(rho * *sc);
+            #[cfg(feature = "std")]
+            if batch_len >= 64 && rayon::current_num_threads() > 1 {
+                use rayon::prelude::*;
+
+                merged_static = prepared
+                    .par_iter()
+                    .zip(rhos.par_iter())
+                    .zip(left_pts.par_chunks_exact_mut(2))
+                    .zip(left_scs.par_chunks_exact_mut(2))
+                    .zip(
+                        right_dyn_pts.par_chunks_exact_mut(DYNAMIC_POINT_COUNT),
+                    )
+                    .zip(
+                        right_dyn_scs.par_chunks_exact_mut(DYNAMIC_POINT_COUNT),
+                    )
+                    .fold(
+                        || [BlsScalar::zero(); STATIC_POINT_COUNT],
+                        |mut acc_st, (((((prep, &rho), lp), ls), rdp), rds)| {
+                            lp[0] = prep.w_z;
+                            lp[1] = prep.w_zw;
+                            rdp.copy_from_slice(&prep.dynamic_points);
+                            if rho == BlsScalar::one() {
+                                for (dst, src) in acc_st
+                                    .iter_mut()
+                                    .zip(prep.static_scalars.iter())
+                                {
+                                    *dst += *src;
+                                }
+                                ls[0] = BlsScalar::one();
+                                ls[1] = prep.u_challenge;
+                                rds.copy_from_slice(&prep.dynamic_scalars);
+                            } else {
+                                for (dst, src) in acc_st
+                                    .iter_mut()
+                                    .zip(prep.static_scalars.iter())
+                                {
+                                    *dst += rho * *src;
+                                }
+                                ls[0] = rho;
+                                ls[1] = rho * prep.u_challenge;
+                                for (dst, src) in rds
+                                    .iter_mut()
+                                    .zip(prep.dynamic_scalars.iter())
+                                {
+                                    *dst = rho * *src;
+                                }
+                            }
+                            acc_st
+                        },
+                    )
+                    .reduce(
+                        || [BlsScalar::zero(); STATIC_POINT_COUNT],
+                        |mut a, b| {
+                            for (dst, src) in a.iter_mut().zip(b.iter()) {
+                                *dst += *src;
+                            }
+                            a
+                        },
+                    );
+            } else {
+                for (idx, (prep, &rho)) in
+                    prepared.iter().zip(rhos.iter()).enumerate()
+                {
+                    left_pts[2 * idx] = prep.w_z;
+                    left_pts[2 * idx + 1] = prep.w_zw;
+                    let rbase = idx * DYNAMIC_POINT_COUNT;
+                    right_dyn_pts[rbase..rbase + DYNAMIC_POINT_COUNT]
+                        .copy_from_slice(&prep.dynamic_points);
+                    if rho == BlsScalar::one() {
+                        for (dst, src) in merged_static
+                            .iter_mut()
+                            .zip(prep.static_scalars.iter())
+                        {
+                            *dst += *src;
+                        }
+                        left_scs[2 * idx] = BlsScalar::one();
+                        left_scs[2 * idx + 1] = prep.u_challenge;
+                        right_dyn_scs[rbase..rbase + DYNAMIC_POINT_COUNT]
+                            .copy_from_slice(&prep.dynamic_scalars);
+                    } else {
+                        for (dst, src) in merged_static
+                            .iter_mut()
+                            .zip(prep.static_scalars.iter())
+                        {
+                            *dst += rho * *src;
+                        }
+                        left_scs[2 * idx] = rho;
+                        left_scs[2 * idx + 1] = rho * prep.u_challenge;
+                        for (dst, src) in right_dyn_scs
+                            [rbase..rbase + DYNAMIC_POINT_COUNT]
+                            .iter_mut()
+                            .zip(prep.dynamic_scalars.iter())
+                        {
+                            *dst = rho * *src;
+                        }
                     }
                 }
             }

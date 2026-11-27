@@ -105,7 +105,7 @@ fn glv_decompose_bytes(bytes: &[u8; SCALAR_BYTES]) -> (u128, u128) {
 /// form) such that `phi(x, y) = (beta * x, y) = [-x^2]P` on G1. Derived and
 /// self-verified once against `G1::generator()` and `2 * G1::generator()` at
 /// initialization time.
-fn glv_beta() -> &'static blst_fp {
+pub(crate) fn glv_beta() -> &'static blst_fp {
     static BETA: std::sync::OnceLock<blst_fp> = std::sync::OnceLock::new();
     BETA.get_or_init(|| {
         let x_sq_le = GLV_X_SQ.to_le_bytes();
@@ -375,10 +375,10 @@ impl BlstStaticVerifierTable {
             let mut sums = [blst_p1::default(); COMB_SUBSETS];
             for t in 0..COMB_TEETH {
                 if t > 0 {
-                    // Advance each active base by `2^64` via 64 doublings.
+                    // Advance each active base by `2^32` via 32 doublings.
                     for (i, base) in tooth_bases.iter_mut().enumerate() {
                         if (amask & (1u8 << i)) != 0 {
-                            for _ in 0..64 {
+                            for _ in 0..32 {
                                 let cur = *base;
                                 // SAFETY: valid Jacobian point.
                                 unsafe {
@@ -441,16 +441,47 @@ impl BlstStaticVerifierTable {
         }
     }
 
-    /// Evaluate all 16 static points serially in a single shared 64-bit
-    /// doubling loop (63 doublings total instead of 126).
-    pub(super) fn eval_serial(
+    /// Decompose the 16 static scalars into `(q, rem)` 128-bit unsigned GLV
+    /// halves (`s = q * x^2 + rem`).
+    fn decompose_scalars(
         &self,
         scalars: &[BlsScalar; STATIC_POINT_COUNT],
+    ) -> ([u128; STATIC_POINT_COUNT], [u128; STATIC_POINT_COUNT]) {
+        let mut qs = [0u128; STATIC_POINT_COUNT];
+        let mut rems = [0u128; STATIC_POINT_COUNT];
+        for g in 0..COMB_GROUPS {
+            let amask = self.active_mask[g];
+            if amask == 0 {
+                continue;
+            }
+            let base = g * COMB_GROUP_SIZE;
+            for i in 0..COMB_GROUP_SIZE {
+                if (amask & (1u8 << i)) == 0 {
+                    continue;
+                }
+                let sc = &scalars[base + i];
+                if *sc == BlsScalar::zero() {
+                    continue;
+                }
+                let b = scalar_to_blst_le_bytes(sc);
+                let (q, rem) = glv_decompose_bytes(&b);
+                qs[base + i] = q;
+                rems[base + i] = rem;
+            }
+        }
+        (qs, rems)
+    }
+
+    /// Evaluate `sum_i [halves[i]] P_i` for 128-bit unsigned scalars in a
+    /// single shared 32-bit doubling loop (`31` doublings total).
+    pub(super) fn eval_half_u128(
+        &self,
+        halves: &[u128; STATIC_POINT_COUNT],
     ) -> blst_p1 {
         if self.tables.is_empty() {
             return blst_p1::default();
         }
-        let mut limbs = [[[0u64; COMB_GROUP_SIZE]; COMB_TEETH]; COMB_GROUPS];
+        let mut limbs = [[[0u32; COMB_GROUP_SIZE]; COMB_TEETH]; COMB_GROUPS];
         let mut active_g = [false; COMB_GROUPS];
         for g in 0..COMB_GROUPS {
             let amask = self.active_mask[g];
@@ -462,20 +493,15 @@ impl BlstStaticVerifierTable {
                 if (amask & (1u8 << i)) == 0 {
                     continue;
                 }
-                let sc = &scalars[base_slot + i];
-                if *sc == BlsScalar::zero() {
+                let h = halves[base_slot + i];
+                if h == 0 {
                     continue;
                 }
                 active_g[g] = true;
-                let b = scalar_to_blst_le_bytes(sc);
-                limbs[g][0][i] =
-                    u64::from_le_bytes(b[0..8].try_into().unwrap());
-                limbs[g][1][i] =
-                    u64::from_le_bytes(b[8..16].try_into().unwrap());
-                limbs[g][2][i] =
-                    u64::from_le_bytes(b[16..24].try_into().unwrap());
-                limbs[g][3][i] =
-                    u64::from_le_bytes(b[24..32].try_into().unwrap());
+                limbs[g][0][i] = h as u32;
+                limbs[g][1][i] = (h >> 32) as u32;
+                limbs[g][2][i] = (h >> 64) as u32;
+                limbs[g][3][i] = (h >> 96) as u32;
             }
         }
         if !(active_g[0] || active_g[1]) {
@@ -484,7 +510,7 @@ impl BlstStaticVerifierTable {
 
         let mut acc = blst_p1::default();
         let mut started = false;
-        for shift in (0..64).rev() {
+        for shift in (0..32).rev() {
             if started {
                 let cur = acc;
                 // SAFETY: valid Jacobian point.
@@ -518,6 +544,36 @@ impl BlstStaticVerifierTable {
             }
         }
         acc
+    }
+
+    /// Combine `rem_sum + (-phi(q_sum))` in Jacobian coordinates using the
+    /// endomorphism homomorphism `-phi(X, Y, Z) = (beta * X, -Y, Z)`.
+    #[inline]
+    fn combine_glv_halves(rem_sum: blst_p1, mut q_sum: blst_p1) -> blst_p1 {
+        let beta = glv_beta();
+        let qx = q_sum.x;
+        let mut out = blst_p1::default();
+        // SAFETY: valid `blst_fp` and `blst_p1` pointers.
+        unsafe {
+            blst_fp_mul(&mut q_sum.x, &qx, beta);
+            blst_fp_cneg(&mut q_sum.y, &q_sum.y, true);
+            blst_p1_add_or_double(&mut out, &rem_sum, &q_sum);
+        }
+        out
+    }
+
+    /// Evaluate all 16 static points serially via GLV-split 32-bit Comb.
+    pub(super) fn eval_serial(
+        &self,
+        scalars: &[BlsScalar; STATIC_POINT_COUNT],
+    ) -> blst_p1 {
+        if self.tables.is_empty() {
+            return blst_p1::default();
+        }
+        let (qs, rems) = self.decompose_scalars(scalars);
+        let rem_sum = self.eval_half_u128(&rems);
+        let q_sum = self.eval_half_u128(&qs);
+        Self::combine_glv_halves(rem_sum, q_sum)
     }
 }
 
@@ -787,10 +843,58 @@ pub(crate) fn verify_single_pipelined_blst(
         count += 1;
     }
 
-    let ((left_inf, ml1), right_proj) = if rayon::current_num_threads() > 1 {
-        // Balanced 2-way split (~330 µs each):
-        //   Branch A: neg_left + ml1 (~165 µs) + first ~60% of dyn (~165 µs)
-        //   Branch B: static Comb (~218 µs) + remaining ~40% of dyn (~120 µs)
+    let ((left_inf, ml1), right_proj) = if rayon::current_num_threads() >= 4 {
+        // Balanced 4-way split (~175 µs each, saturating 4 P-cores):
+        //   Branch 1: neg_left + ml1 (~165 µs)
+        //   Branch 2: static_rem 32-bit Comb (~95 µs) + ~25% dyn (~65 µs)
+        //   Branch 3: static_q 32-bit Comb (~95 µs) + ~25% dyn (~65 µs)
+        //   Branch 4: remaining ~50% dyn (~130 µs)
+        let (qs, rems) = static_table.decompose_scalars(static_scalars);
+        let s1 = count / 4;
+        let s2 = count / 2;
+        let ((l, (rem_sum, dyn_a)), ((q_sum, dyn_b), dyn_c)) = rayon::join(
+            || {
+                rayon::join(compute_neg_left_and_ml1, || {
+                    let rs = static_table.eval_half_u128(&rems);
+                    let da = glv_straus_blst(
+                        &pts[..s1],
+                        &sbytes[..s1 * SCALAR_BYTES],
+                    );
+                    (rs, da)
+                })
+            },
+            || {
+                rayon::join(
+                    || {
+                        let qs_pt = static_table.eval_half_u128(&qs);
+                        let db = glv_straus_blst(
+                            &pts[s1..s2],
+                            &sbytes[s1 * SCALAR_BYTES..s2 * SCALAR_BYTES],
+                        );
+                        (qs_pt, db)
+                    },
+                    || {
+                        glv_straus_blst(
+                            &pts[s2..count],
+                            &sbytes[s2 * SCALAR_BYTES..count * SCALAR_BYTES],
+                        )
+                    },
+                )
+            },
+        );
+        let mut right =
+            BlstStaticVerifierTable::combine_glv_halves(rem_sum, q_sum);
+        // SAFETY: valid Jacobian points.
+        unsafe {
+            let cur = right;
+            blst_p1_add_or_double(&mut right, &cur, &dyn_a);
+            let cur = right;
+            blst_p1_add_or_double(&mut right, &cur, &dyn_b);
+            let cur = right;
+            blst_p1_add_or_double(&mut right, &cur, &dyn_c);
+        }
+        (l, right)
+    } else if rayon::current_num_threads() > 1 {
         let split = (count * 3) / 5;
         let (((l_inf, ml1), dyn_a), (static_sum, dyn_b)) = rayon::join(
             || {
@@ -813,8 +917,10 @@ pub(crate) fn verify_single_pipelined_blst(
         let mut right = static_sum;
         // SAFETY: valid Jacobian points.
         unsafe {
-            blst_p1_add_or_double(&mut right, &right, &dyn_a);
-            blst_p1_add_or_double(&mut right, &right, &dyn_b);
+            let cur = right;
+            blst_p1_add_or_double(&mut right, &cur, &dyn_a);
+            let cur = right;
+            blst_p1_add_or_double(&mut right, &cur, &dyn_b);
         }
         ((l_inf, ml1), right)
     } else {
@@ -862,8 +968,7 @@ pub(crate) fn verify_batch_pipelined_blst(
     lines_x_h: &[blst_fp6; 68],
     lines_h: &[blst_fp6; 68],
 ) -> bool {
-    let compute_neg_left_and_ml1 = || -> (bool, blst_fp12) {
-        let neg_left_proj = msm_variable_base_proj(left_pts, left_scs);
+    let finish_ml1 = |neg_left_proj: blst_p1| -> (bool, blst_fp12) {
         let mut neg_left_aff = blst_p1_affine::default();
         let mut ml1 = blst_fp12::default();
         // SAFETY: valid Jacobian/affine and precomputed 68-line pointers.
@@ -882,7 +987,78 @@ pub(crate) fn verify_batch_pipelined_blst(
         (left_inf, ml1)
     };
 
-    let ((left_inf, ml1), right_proj) = if rayon::current_num_threads() > 1 {
+    let compute_neg_left_and_ml1 = || -> (bool, blst_fp12) {
+        finish_ml1(msm_variable_base_proj(left_pts, left_scs))
+    };
+
+    #[cfg(feature = "gpu-cuda")]
+    let gpu_res: Option<((bool, blst_fp12), blst_p1)> = if right_pts.len()
+        >= crate::gpu_cuda::GPU_VERIFY_MSM_MIN_LEN
+    {
+        if left_pts.len() >= 4096 {
+            // Huge batch (`B >= 2048`): offload BOTH `left` and `right`
+            // MSMs to GPU, overlapping static Comb with `left` and `ml1`
+            // with `right`!
+            if let Some((neg_left_proj, s_opt)) =
+                crate::gpu_cuda::msm_variable_base_gpu_with_overlap(
+                    left_pts,
+                    left_scs,
+                    || static_part.map(|(tbl, scs)| tbl.eval_serial(scs)),
+                )
+            {
+                crate::gpu_cuda::msm_variable_base_gpu_with_overlap(
+                    right_pts,
+                    right_scs,
+                    || finish_ml1(neg_left_proj),
+                )
+                .map(|(mut r, l)| {
+                    if let Some(s) = s_opt {
+                        let cur = r;
+                        // SAFETY: valid Jacobian points.
+                        unsafe { blst_p1_add_or_double(&mut r, &cur, &s) };
+                    }
+                    (l, r)
+                })
+            } else {
+                None
+            }
+        } else {
+            // Medium/large batch: run `right` MSM on GPU while CPU
+            // concurrently finishes `left` MSM + `ml1` + static Comb!
+            crate::gpu_cuda::msm_variable_base_gpu_with_overlap(
+                right_pts,
+                right_scs,
+                || {
+                    if rayon::current_num_threads() > 1 {
+                        rayon::join(compute_neg_left_and_ml1, || {
+                            static_part.map(|(tbl, scs)| tbl.eval_serial(scs))
+                        })
+                    } else {
+                        (
+                            compute_neg_left_and_ml1(),
+                            static_part.map(|(tbl, scs)| tbl.eval_serial(scs)),
+                        )
+                    }
+                },
+            )
+            .map(|(mut r, (l, s_opt))| {
+                if let Some(s) = s_opt {
+                    let cur = r;
+                    // SAFETY: valid Jacobian points.
+                    unsafe { blst_p1_add_or_double(&mut r, &cur, &s) };
+                }
+                (l, r)
+            })
+        }
+    } else {
+        None
+    };
+    #[cfg(not(feature = "gpu-cuda"))]
+    let gpu_res: Option<((bool, blst_fp12), blst_p1)> = None;
+
+    let ((left_inf, ml1), right_proj) = if let Some(res) = gpu_res {
+        res
+    } else if rayon::current_num_threads() > 1 {
         let ((l, s_opt), mut r) = rayon::join(
             || {
                 rayon::join(compute_neg_left_and_ml1, || {

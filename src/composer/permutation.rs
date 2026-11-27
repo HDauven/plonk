@@ -14,6 +14,7 @@ use rayon::prelude::*;
 
 use crate::composer::{WireData, Witness};
 use crate::fft::{EvaluationDomain, Polynomial};
+#[cfg(not(feature = "std"))]
 use crate::util::batch_inversion_with_scratch;
 
 pub(crate) mod constants;
@@ -232,16 +233,137 @@ impl Permutation {
         let chunk_step =
             group_gen.pow_vartime(&[PERM_CHUNK_SIZE as u64, 0, 0, 0]);
 
-        // Compute `ratios[i] = numerator[i] / denominator[i]` in L1-resident
-        // chunks so both root generation and Montgomery batch inversion run in
-        // parallel without full-domain intermediate allocations.
-        let mut ratios = vec![BlsScalar::zero(); n];
+        #[cfg(feature = "std")]
+        {
+            use crate::fast_fr::{
+                FastFr, perm_chunk_prefix_fast, scale_fast_fr_to_bls_chunk,
+            };
 
-        let process_chunk =
-            |chunk_idx: usize,
-             out_chunk: &mut [BlsScalar],
-             denoms: &mut Vec<BlsScalar>,
-             prod: &mut Vec<BlsScalar>| {
+            let f_gen = FastFr::from_bls(&group_gen);
+            let f_beta = FastFr::from_bls(beta);
+            let f_bk1 = FastFr::from_bls(&beta_k1);
+            let f_bk2 = FastFr::from_bls(&beta_k2);
+            let f_bk3 = FastFr::from_bls(&beta_k3);
+            let f_gamma = FastFr::from_bls(gamma);
+
+            let mut local_prefixes = vec![FastFr::ZERO; n];
+            let chunk_totals: Vec<FastFr> =
+                if n >= PERM_CHUNK_SIZE * 2 && rayon::current_num_threads() > 1
+                {
+                    local_prefixes
+                        .par_chunks_mut(PERM_CHUNK_SIZE)
+                        .enumerate()
+                        .map_init(
+                            || {
+                                (
+                                    Vec::with_capacity(PERM_CHUNK_SIZE),
+                                    Vec::with_capacity(PERM_CHUNK_SIZE),
+                                )
+                            },
+                            |(denoms, prods), (chunk_idx, out_chunk)| {
+                                let start = chunk_idx * PERM_CHUNK_SIZE;
+                                let root =
+                                    FastFr::from_bls(&chunk_step.pow_vartime(
+                                        &[chunk_idx as u64, 0, 0, 0],
+                                    ));
+                                perm_chunk_prefix_fast(
+                                    wires,
+                                    sigma_evaluations,
+                                    start,
+                                    root,
+                                    f_gen,
+                                    f_beta,
+                                    f_bk1,
+                                    f_bk2,
+                                    f_bk3,
+                                    f_gamma,
+                                    out_chunk,
+                                    denoms,
+                                    prods,
+                                )
+                            },
+                        )
+                        .collect()
+                } else {
+                    let mut denoms = Vec::with_capacity(PERM_CHUNK_SIZE.min(n));
+                    let mut prods = Vec::with_capacity(PERM_CHUNK_SIZE.min(n));
+                    local_prefixes
+                        .chunks_mut(PERM_CHUNK_SIZE)
+                        .enumerate()
+                        .map(|(chunk_idx, out_chunk)| {
+                            let start = chunk_idx * PERM_CHUNK_SIZE;
+                            let root =
+                                FastFr::from_bls(&chunk_step.pow_vartime(&[
+                                    chunk_idx as u64,
+                                    0,
+                                    0,
+                                    0,
+                                ]));
+                            perm_chunk_prefix_fast(
+                                wires,
+                                sigma_evaluations,
+                                start,
+                                root,
+                                f_gen,
+                                f_beta,
+                                f_bk1,
+                                f_bk2,
+                                f_bk3,
+                                f_gamma,
+                                out_chunk,
+                                &mut denoms,
+                                &mut prods,
+                            )
+                        })
+                        .collect()
+                };
+
+            let mut chunk_starts = Vec::with_capacity(chunk_totals.len());
+            let mut running = BlsScalar::one();
+            for tot in chunk_totals {
+                chunk_starts.push(FastFr::from_bls(&running));
+                running *= tot.to_bls();
+            }
+
+            let mut out = vec![BlsScalar::zero(); n];
+            if n >= PERM_CHUNK_SIZE * 2 && rayon::current_num_threads() > 1 {
+                out.par_chunks_mut(PERM_CHUNK_SIZE)
+                    .zip(local_prefixes.par_chunks(PERM_CHUNK_SIZE))
+                    .enumerate()
+                    .for_each(|(chunk_idx, (dst, src))| {
+                        scale_fast_fr_to_bls_chunk(
+                            src,
+                            chunk_starts[chunk_idx],
+                            dst,
+                        );
+                    });
+            } else {
+                for (chunk_idx, (dst, src)) in out
+                    .chunks_mut(PERM_CHUNK_SIZE)
+                    .zip(local_prefixes.chunks(PERM_CHUNK_SIZE))
+                    .enumerate()
+                {
+                    scale_fast_fr_to_bls_chunk(
+                        src,
+                        chunk_starts[chunk_idx],
+                        dst,
+                    );
+                }
+            }
+            out
+        }
+
+        #[cfg(not(feature = "std"))]
+        {
+            // Compute `ratios[i] = numerator[i] / denominator[i]` in L1-resident
+            // chunks so both root generation and Montgomery batch inversion run
+            // without full-domain intermediate allocations.
+            let mut ratios = vec![BlsScalar::zero(); n];
+            let mut denoms = Vec::with_capacity(PERM_CHUNK_SIZE.min(n));
+            let mut prod = Vec::with_capacity(PERM_CHUNK_SIZE.min(n));
+            for (chunk_idx, out_chunk) in
+                ratios.chunks_mut(PERM_CHUNK_SIZE).enumerate()
+            {
                 let start = chunk_idx * PERM_CHUNK_SIZE;
                 let len = out_chunk.len();
                 let mut root =
@@ -272,61 +394,25 @@ impl Permutation {
                     root *= &group_gen;
                 }
 
-                batch_inversion_with_scratch(denoms, prod);
+                batch_inversion_with_scratch(&mut denoms, &mut prod);
                 for (slot, den_inv) in
                     out_chunk[..len].iter_mut().zip(denoms.iter())
                 {
                     *slot *= den_inv;
                 }
-            };
+            }
 
-        #[cfg(feature = "std")]
-        if n >= PERM_CHUNK_SIZE * 2 && rayon::current_num_threads() > 1 {
+            // Prefix product in place: `permutation[0] = 1`,
+            // `permutation[i + 1] = permutation[i] * ratios[i]`.
+            let mut product = BlsScalar::one();
+            for slot in &mut ratios {
+                let ratio = *slot;
+                *slot = product;
+                product *= &ratio;
+            }
+
             ratios
-                .par_chunks_mut(PERM_CHUNK_SIZE)
-                .enumerate()
-                .for_each_init(
-                    || {
-                        (
-                            Vec::with_capacity(PERM_CHUNK_SIZE),
-                            Vec::with_capacity(PERM_CHUNK_SIZE),
-                        )
-                    },
-                    |(denoms, prod), (chunk_idx, out_chunk)| {
-                        process_chunk(chunk_idx, out_chunk, denoms, prod);
-                    },
-                );
-        } else {
-            let mut denoms = Vec::with_capacity(PERM_CHUNK_SIZE.min(n));
-            let mut prod = Vec::with_capacity(PERM_CHUNK_SIZE.min(n));
-            for (chunk_idx, out_chunk) in
-                ratios.chunks_mut(PERM_CHUNK_SIZE).enumerate()
-            {
-                process_chunk(chunk_idx, out_chunk, &mut denoms, &mut prod);
-            }
         }
-
-        #[cfg(not(feature = "std"))]
-        {
-            let mut denoms = Vec::with_capacity(PERM_CHUNK_SIZE.min(n));
-            let mut prod = Vec::with_capacity(PERM_CHUNK_SIZE.min(n));
-            for (chunk_idx, out_chunk) in
-                ratios.chunks_mut(PERM_CHUNK_SIZE).enumerate()
-            {
-                process_chunk(chunk_idx, out_chunk, &mut denoms, &mut prod);
-            }
-        }
-
-        // Prefix product in place: `permutation[0] = 1`,
-        // `permutation[i + 1] = permutation[i] * ratios[i]`.
-        let mut product = BlsScalar::one();
-        for slot in &mut ratios {
-            let ratio = *slot;
-            *slot = product;
-            product *= &ratio;
-        }
-
-        ratios
     }
 }
 
