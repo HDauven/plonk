@@ -34,8 +34,9 @@ use driver::{CuFunction, CudaBuf, CudaDriver, CudaHostBuf};
 /// Minimum polynomial length to offload an MSM to GPU.
 pub(crate) const GPU_MSM_MIN_LEN: usize = 4096;
 
-/// Minimum domain size `n` to offload batched `Fr` NTTs to GPU.
-pub(crate) const GPU_NTT_MIN_LEN: usize = 8192;
+/// Minimum domain size `n` to offload the full 8-coset quotient engine
+/// (NTT + pointwise widgets + IFFT) to GPU.
+pub(crate) const GPU_NTT_MIN_LEN: usize = 4096;
 
 /// `1` in BLS12-381 `Fp` Montgomery form.
 const FP_ONE_BLST: blst_fp = blst_fp {
@@ -104,6 +105,8 @@ impl GpuMsmScratch {
 struct GpuNttScratch {
     src: CudaBuf,
     out: CudaBuf,
+    q_evals: CudaBuf,
+    ch_buf: CudaBuf,
     host_src: CudaHostBuf<FastFr>,
     host_out: CudaHostBuf<FastFr>,
 }
@@ -113,6 +116,8 @@ impl GpuNttScratch {
         Ok(Self {
             src: CudaBuf::alloc(drv, 16)?,
             out: CudaBuf::alloc(drv, 16)?,
+            q_evals: CudaBuf::alloc(drv, 16)?,
+            ch_buf: CudaBuf::alloc(drv, 44 * core::mem::size_of::<FastFr>())?,
             host_src: CudaHostBuf::new(drv),
             host_out: CudaHostBuf::new(drv),
         })
@@ -129,6 +134,7 @@ struct GpuRuntime {
     fn_ntt_coset_stage8: CuFunction,
     fn_ntt_bitrev_stage8: CuFunction,
     fn_ntt_radix2: CuFunction,
+    fn_quot_eval: CuFunction,
     #[cfg(test)]
     fn_test_fp: CuFunction,
     scratch: Mutex<GpuMsmScratch>,
@@ -172,6 +178,8 @@ fn gpu_runtime() -> Option<&'static GpuRuntime> {
                 drv.get_function(module, "ntt_bitrev_stage8").ok()?;
             let fn_ntt_radix2 =
                 drv.get_function(module, "ntt_radix2_stage").ok()?;
+            let fn_quot_eval =
+                drv.get_function(module, "quotient_eval_wave").ok()?;
             #[cfg(test)]
             let fn_test_fp = drv.get_function(module, "test_fp_ops").ok()?;
             let scratch = GpuMsmScratch::new(drv).ok()?;
@@ -186,6 +194,7 @@ fn gpu_runtime() -> Option<&'static GpuRuntime> {
                 fn_ntt_coset_stage8,
                 fn_ntt_bitrev_stage8,
                 fn_ntt_radix2,
+                fn_quot_eval,
                 #[cfg(test)]
                 fn_test_fp,
                 scratch: Mutex::new(scratch),
@@ -673,8 +682,10 @@ impl GpuCommitBases {
     }
 }
 
-/// Device-resident `Fr` NTT twiddle and coset tables owned lazily by
-/// `FastProverCache`.
+/// Device-resident `Fr` NTT twiddle, coset, and selector tables owned lazily by
+/// `FastProverCache`. Keeps the entire 8-coset quotient pipeline (40 forward
+/// coset NTTs + 524K pointwise PLONK widget evaluations + 8 inverse coset
+/// IFFTs) resident in VRAM with zero intermediate PCIe transfers.
 pub(crate) struct GpuNttTables {
     n: usize,
     log_n: u32,
@@ -685,11 +696,25 @@ pub(crate) struct GpuNttTables {
     coset_powers_d: CudaBuf,
     /// Flat `[8]` `FastFr` `c_k^n` values.
     ck_pown_d: CudaBuf,
+    /// Owned VRAM buffers for the 13–17 flat `[8 * n]` selector/precomputed
+    /// evaluation tables.
+    _sel_bufs: Vec<CudaBuf>,
+    /// Device `[u64; 17]` pointer table (`0` for absent optional selectors).
+    sel_ptrs_d: CudaBuf,
+    /// Precomputed `vanishing_inv[0..8]` for each coset.
+    vanishing_inv: [FastFr; 8],
 }
 
 impl GpuNttTables {
-    /// Upload `domain_fft_roots`, `domain_ifft_roots`, `domain_size_inv`, and
-    /// all 8 cosets' `coset_powers` + `c_k_pow_n` once to GPU VRAM.
+    /// Upload `domain_fft_roots`, `domain_ifft_roots`, `domain_size_inv`,
+    /// coset powers, and all 17 selector/precomputed evaluation tables once to
+    /// GPU VRAM.
+    ///
+    /// `selectors[s]` (`0..17`) holds `Option<[&[FastFr]; 8]>` in the exact
+    /// order expected by `quotient_eval_wave`:
+    /// `q_m, q_l, q_r, q_o, q_f, q_c, q_arith, q_range, q_logic, q_fixed,
+    ///  q_var, s_sigma_1..4, linear_evals, l1_evals`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn upload(
         n: usize,
         log_n: u32,
@@ -698,6 +723,8 @@ impl GpuNttTables {
         size_inv: FastFr,
         coset_powers: [&[FastFr]; 8],
         ck_pown: [FastFr; 8],
+        vanishing_inv: [FastFr; 8],
+        selectors: [Option<[Option<&[FastFr]>; 8]>; 17],
     ) -> Option<Self> {
         if n < GPU_NTT_MIN_LEN || !n.is_power_of_two() || log_n < 8 {
             return None;
@@ -717,18 +744,43 @@ impl GpuNttTables {
             CudaBuf::alloc(rt.drv, core::mem::size_of::<FastFr>()).ok()?;
         rt.drv.copy_htod(size_inv_d.ptr, &[size_inv]).ok()?;
 
-        let mut flat_cp = Vec::with_capacity(8 * n);
+        let mut flat = Vec::with_capacity(8 * n);
         for cp in coset_powers {
-            flat_cp.extend_from_slice(cp);
+            flat.extend_from_slice(cp);
         }
         let coset_powers_d =
-            CudaBuf::alloc(rt.drv, core::mem::size_of_val(flat_cp.as_slice()))
+            CudaBuf::alloc(rt.drv, core::mem::size_of_val(flat.as_slice()))
                 .ok()?;
-        rt.drv.copy_htod(coset_powers_d.ptr, &flat_cp).ok()?;
+        rt.drv.copy_htod(coset_powers_d.ptr, &flat).ok()?;
 
         let ck_pown_d =
             CudaBuf::alloc(rt.drv, core::mem::size_of_val(&ck_pown)).ok()?;
         rt.drv.copy_htod(ck_pown_d.ptr, &ck_pown).ok()?;
+
+        let mut sel_bufs = Vec::with_capacity(17);
+        let mut sel_ptrs = [0u64; 17];
+        let sel_bytes = 8 * n * core::mem::size_of::<FastFr>();
+        for (s_idx, opt_cosets) in selectors.into_iter().enumerate() {
+            let Some(coset_slices) = opt_cosets else {
+                continue;
+            };
+            flat.clear();
+            for opt_slice in coset_slices {
+                if let Some(sl) = opt_slice {
+                    flat.extend_from_slice(sl);
+                } else {
+                    flat.resize(flat.len() + n, FastFr::ZERO);
+                }
+            }
+            let buf = CudaBuf::alloc(rt.drv, sel_bytes).ok()?;
+            rt.drv.copy_htod(buf.ptr, &flat).ok()?;
+            sel_ptrs[s_idx] = buf.ptr;
+            sel_bufs.push(buf);
+        }
+
+        let sel_ptrs_d =
+            CudaBuf::alloc(rt.drv, core::mem::size_of_val(&sel_ptrs)).ok()?;
+        rt.drv.copy_htod(sel_ptrs_d.ptr, &sel_ptrs).ok()?;
 
         Some(Self {
             n,
@@ -738,12 +790,248 @@ impl GpuNttTables {
             size_inv_d,
             coset_powers_d,
             ck_pown_d,
+            _sel_bufs: sel_bufs,
+            sel_ptrs_d,
+            vanishing_inv,
         })
+    }
+
+    /// Run the **entire** 8-coset quotient pipeline in GPU VRAM:
+    /// 1. Upload `5` (or `6`) source polynomials ONCE via pinned DMA.
+    /// 2. For both waves (`0..4` and `4..8`): fused coset NTTs + pointwise
+    ///    6-widget PLONK constraint evaluation + vanishing division in VRAM.
+    /// 3. Run all 8 coset IFFTs in VRAM (with fused `size_inv` scaling).
+    /// 4. Download ONLY the 8 `n`-point coset IFFTs ONCE via pinned DMA and
+    ///    invoke `f` with the flat `&[FastFr]` slice (`[8 * n]`, zero copy).
+    pub(crate) fn with_full_quotient_iffts<F, R>(
+        &self,
+        polys: &[&[BlsScalar]],
+        challenges: &[FastFr; 36],
+        f: F,
+    ) -> Option<R>
+    where
+        F: FnOnce(&[FastFr]) -> R,
+    {
+        let num_polys = polys.len();
+        if num_polys != 5 && num_polys != 6 {
+            return None;
+        }
+        let max_len = polys.iter().map(|p| p.len()).max().unwrap_or(0);
+        if max_len > 2 * self.n {
+            return None;
+        }
+        let src_stride = max_len.max(self.n);
+        let rt = gpu_runtime()?;
+        rt.drv.bind_ctx().ok()?;
+
+        let wave_batch = 4 * num_polys;
+        let wave_elems = wave_batch * self.n;
+        let q_elems = 8 * self.n;
+        let out_elems = wave_elems.max(q_elems);
+        let src_elems = num_polys * src_stride;
+
+        let mut scratch_guard = rt.ntt_scratch.lock().ok()?;
+        let scratch = &mut *scratch_guard;
+        scratch
+            .src
+            .ensure_capacity(src_elems * core::mem::size_of::<FastFr>())
+            .ok()?;
+        scratch
+            .out
+            .ensure_capacity(out_elems * core::mem::size_of::<FastFr>())
+            .ok()?;
+        scratch
+            .q_evals
+            .ensure_capacity(q_elems * core::mem::size_of::<FastFr>())
+            .ok()?;
+
+        let src_ptr = scratch.src.ptr;
+        let out_ptr = scratch.out.ptr;
+        let q_ptr = scratch.q_evals.ptr;
+        let ch_ptr = scratch.ch_buf.ptr;
+
+        // 1. Pack & DMA-upload source polynomials ONCE + tiny 1.4 KB challenges.
+        let packed = scratch.host_src.ensure_len(src_elems);
+        packed
+            .par_chunks_exact_mut(src_stride)
+            .zip(polys.par_iter())
+            .for_each(|(dst, src)| {
+                for (d, s) in dst[..src.len()].iter_mut().zip(src.iter()) {
+                    *d = FastFr::from_bls(s);
+                }
+                for d in &mut dst[src.len()..] {
+                    *d = FastFr::ZERO;
+                }
+            });
+        rt.drv.copy_htod(src_ptr, packed).ok()?;
+
+        let mut ch_all = [FastFr::ZERO; 44];
+        ch_all[..36].copy_from_slice(challenges);
+        ch_all[36..44].copy_from_slice(&self.vanishing_inv);
+        rt.drv.copy_htod(ch_ptr, &ch_all).ok()?;
+
+        // 2. Wave 0 and Wave 1: forward coset NTTs + pointwise evaluation in VRAM.
+        let mut p_src = src_ptr;
+        let mut p_fft_roots = self.fft_roots_d.ptr;
+        let mut p_out = out_ptr;
+        let mut p_q_out = q_ptr;
+        let mut p_sel_ptrs = self.sel_ptrs_d.ptr;
+        let mut p_ch = ch_ptr;
+        let mut p_n = self.n as u32;
+        let mut p_log_n = self.log_n;
+        let mut p_stride = src_stride as u32;
+        let mut p_npolys = num_polys as u32;
+        let mut p_zero_scale: u64 = 0;
+        let mut p_wave_bf = (wave_batch * (self.n / 2)) as u32;
+        let grid_cf = (wave_batch * (self.n / 256)) as u32;
+        let grid_wave_bf = p_wave_bf.div_ceil(256);
+        let grid_eval = ((4 * self.n) as u32).div_ceil(256);
+
+        for wave in 0..2usize {
+            let k_base = wave * 4;
+            let mut p_cp = self.coset_powers_d.ptr
+                + (k_base * self.n * core::mem::size_of::<FastFr>()) as u64;
+            let mut p_ckp = self.ck_pown_d.ptr
+                + (k_base * core::mem::size_of::<FastFr>()) as u64;
+            let mut params_cf: [*mut c_void; 9] = [
+                (&mut p_src as *mut u64).cast(),
+                (&mut p_cp as *mut u64).cast(),
+                (&mut p_ckp as *mut u64).cast(),
+                (&mut p_fft_roots as *mut u64).cast(),
+                (&mut p_out as *mut u64).cast(),
+                (&mut p_n as *mut u32).cast(),
+                (&mut p_log_n as *mut u32).cast(),
+                (&mut p_stride as *mut u32).cast(),
+                (&mut p_npolys as *mut u32).cast(),
+            ];
+            // SAFETY: matches `ntt_coset_fold_stage8` signature.
+            unsafe {
+                rt.drv
+                    .launch(
+                        rt.fn_ntt_coset_stage8,
+                        (grid_cf, 1, 1),
+                        (128, 1, 1),
+                        0,
+                        &mut params_cf,
+                    )
+                    .ok()?;
+            }
+
+            for stage in 8..self.log_n {
+                let mut p_stage = stage;
+                let mut params_r2: [*mut c_void; 7] = [
+                    (&mut p_out as *mut u64).cast(),
+                    (&mut p_fft_roots as *mut u64).cast(),
+                    (&mut p_zero_scale as *mut u64).cast(),
+                    (&mut p_n as *mut u32).cast(),
+                    (&mut p_log_n as *mut u32).cast(),
+                    (&mut p_stage as *mut u32).cast(),
+                    (&mut p_wave_bf as *mut u32).cast(),
+                ];
+                // SAFETY: matches `ntt_radix2_stage` signature.
+                unsafe {
+                    rt.drv
+                        .launch(
+                            rt.fn_ntt_radix2,
+                            (grid_wave_bf, 1, 1),
+                            (256, 1, 1),
+                            0,
+                            &mut params_r2,
+                        )
+                        .ok()?;
+                }
+            }
+
+            let mut p_k_base = k_base as u32;
+            let mut params_ev: [*mut c_void; 8] = [
+                (&mut p_out as *mut u64).cast(),
+                (&mut p_sel_ptrs as *mut u64).cast(),
+                (&mut p_ch as *mut u64).cast(),
+                (&mut p_q_out as *mut u64).cast(),
+                (&mut p_n as *mut u32).cast(),
+                (&mut p_log_n as *mut u32).cast(),
+                (&mut p_k_base as *mut u32).cast(),
+                (&mut p_npolys as *mut u32).cast(),
+            ];
+            // SAFETY: matches `quotient_eval_wave` signature.
+            unsafe {
+                rt.drv
+                    .launch(
+                        rt.fn_quot_eval,
+                        (grid_eval, 1, 1),
+                        (256, 1, 1),
+                        0,
+                        &mut params_ev,
+                    )
+                    .ok()?;
+            }
+        }
+
+        // 3. Run all 8 coset IFFTs directly from `q_evals` -> `out` in VRAM.
+        let mut p_ifft_roots = self.ifft_roots_d.ptr;
+        let mut params_br: [*mut c_void; 5] = [
+            (&mut p_q_out as *mut u64).cast(),
+            (&mut p_ifft_roots as *mut u64).cast(),
+            (&mut p_out as *mut u64).cast(),
+            (&mut p_n as *mut u32).cast(),
+            (&mut p_log_n as *mut u32).cast(),
+        ];
+        let grid_br = (8 * (self.n / 256)) as u32;
+        // SAFETY: matches `ntt_bitrev_stage8` signature.
+        unsafe {
+            rt.drv
+                .launch(
+                    rt.fn_ntt_bitrev_stage8,
+                    (grid_br, 1, 1),
+                    (128, 1, 1),
+                    0,
+                    &mut params_br,
+                )
+                .ok()?;
+        }
+
+        let mut p_ifft_bf = (8 * (self.n / 2)) as u32;
+        let grid_ifft_bf = p_ifft_bf.div_ceil(256);
+        for stage in 8..self.log_n {
+            let mut p_stage = stage;
+            let mut p_scale = if stage + 1 == self.log_n {
+                self.size_inv_d.ptr
+            } else {
+                0
+            };
+            let mut params_r2: [*mut c_void; 7] = [
+                (&mut p_out as *mut u64).cast(),
+                (&mut p_ifft_roots as *mut u64).cast(),
+                (&mut p_scale as *mut u64).cast(),
+                (&mut p_n as *mut u32).cast(),
+                (&mut p_log_n as *mut u32).cast(),
+                (&mut p_stage as *mut u32).cast(),
+                (&mut p_ifft_bf as *mut u32).cast(),
+            ];
+            // SAFETY: matches `ntt_radix2_stage` signature.
+            unsafe {
+                rt.drv
+                    .launch(
+                        rt.fn_ntt_radix2,
+                        (grid_ifft_bf, 1, 1),
+                        (256, 1, 1),
+                        0,
+                        &mut params_r2,
+                    )
+                    .ok()?;
+            }
+        }
+
+        // 4. Single pinned DMA download of the 8 coset IFFTs (`8 * n` FastFrs).
+        let flat_out = scratch.host_out.ensure_len(q_elems);
+        rt.drv.copy_dtoh(flat_out, out_ptr).ok()?;
+        Some(f(flat_out))
     }
 
     /// Evaluate 4 cosets (`k_base .. k_base + 4`) × `polys.len()` polynomials
     /// (`5` or `6`) in one batched GPU NTT pass and invoke `f` with the flat
     /// pinned host slice (`[4 * polys.len() * n]`, zero extra copies/allocs!).
+    #[cfg(test)]
     pub(crate) fn with_coset_ffts_wave<F>(
         &self,
         k_base: usize,
@@ -880,6 +1168,7 @@ impl GpuNttTables {
 
     /// Run a batch of `n`-point inverse NTTs (`evals -> coeffs`, scaled by
     /// `domain_size_inv`) on GPU using reusable pinned host DMA buffers.
+    #[cfg(test)]
     pub(crate) fn batch_ifft(
         &self,
         evals: &[Vec<FastFr>],
@@ -1171,6 +1460,8 @@ mod tests {
             size_inv,
             cp_refs,
             ck_pown,
+            [FastFr::ONE; 8],
+            [None; 17],
         )
         .expect("GPU NTT table upload should succeed");
 
@@ -1226,6 +1517,127 @@ mod tests {
             assert_eq!(
                 got_ifft[k], expected,
                 "GPU batch IFFT mismatch at k={k}"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_cuda_full_quotient_matches_cpu_all_widgets() {
+        if gpu_runtime().is_none() {
+            eprintln!("skipping gpu_cuda quotient test: no CUDA GPU available");
+            return;
+        }
+        use crate::composer::{Composer, Constraint, TorsionFreeWitnessPoint};
+        use crate::fast_quotient::FastProverCache;
+        use crate::fft::{EvaluationDomain, Polynomial};
+        use crate::prelude::{Circuit, Compiler, Error, PublicParameters};
+        use dusk_jubjub::JubJubScalar;
+
+        #[derive(Default)]
+        struct AllWidgetsCircuit;
+        impl Circuit for AllWidgetsCircuit {
+            fn circuit(&self, composer: &mut Composer) -> Result<(), Error> {
+                let a = composer.append_witness(BlsScalar::from(2u64));
+                let b = composer.append_witness(BlsScalar::from(3u64));
+                let x = composer.append_witness(BlsScalar::from(6u64));
+                let y = composer.append_witness(JubJubScalar::from(7u64));
+                let pt =
+                    dusk_jubjub::GENERATOR_EXTENDED * JubJubScalar::from(7u64);
+                let z = composer.append_point(pt)?;
+                let tf_z = TorsionFreeWitnessPoint::new_unchecked(z);
+                composer.append_public(42u64);
+                while composer.constraints() < 2500 {
+                    let r =
+                        composer.gate_mul(Constraint::new().mult(1).a(a).b(b));
+                    composer.assert_equal(x, r);
+                    composer.append_logic_and::<63>(a, b);
+                    composer.append_logic_xor::<63>(a, b);
+                    composer.component_range_bits::<64>(a);
+                    composer.component_mul_generator(
+                        y,
+                        dusk_jubjub::GENERATOR_EXTENDED,
+                    )?;
+                    composer.component_mul_point(y, tf_z);
+                }
+                Ok(())
+            }
+        }
+
+        let mut rng = StdRng::seed_from_u64(0x9070_cafe);
+        let pp = PublicParameters::setup(1 << 13, &mut rng).unwrap();
+        let (prover, verifier) =
+            Compiler::compile::<AllWidgetsCircuit>(&pp, b"gpu-quot-test")
+                .unwrap();
+
+        // 1) End-to-end prove + verify exercises all 6 widgets + PI on GPU.
+        let (proof, pi) = prover
+            .prove(&mut StdRng::seed_from_u64(7), &AllWidgetsCircuit)
+            .unwrap();
+        verifier.verify(&proof, &pi).unwrap();
+
+        // 2) Direct bit-for-bit GPU vs CPU comparison for both `beta != 0`
+        // (factored path) and `beta == 0` (unfactored fallback), with and
+        // without public inputs.
+        let domain = EvaluationDomain::new(prover.constraints).unwrap();
+        let qdomain = EvaluationDomain::new(8 * domain.size()).unwrap();
+        let n = domain.size();
+        assert!(n >= GPU_NTT_MIN_LEN);
+
+        let v_h = &prover.prover_key.v_h_coset_8n().evals;
+        let van_inv: [BlsScalar; 8] =
+            core::array::from_fn(|k| v_h[k].invert().unwrap());
+        let cache = FastProverCache::new(
+            &domain,
+            &qdomain,
+            &prover.prover_key,
+            &van_inv,
+        );
+
+        let rand_poly = |len: usize, r: &mut StdRng| {
+            Polynomial::from_coefficients_vec(
+                (0..len).map(|_| BlsScalar::random(&mut *r)).collect(),
+            )
+        };
+        let z_p = rand_poly(n + 3, &mut rng);
+        let a_p = rand_poly(n + 2, &mut rng);
+        let b_p = rand_poly(n + 2, &mut rng);
+        let c_p = rand_poly(n + 2, &mut rng);
+        let d_p = rand_poly(n + 2, &mut rng);
+        let pi_p = rand_poly(n, &mut rng);
+        let zero_pi = Polynomial::zero();
+
+        for (beta, pi_ref) in [
+            (BlsScalar::random(&mut rng), &pi_p),
+            (BlsScalar::zero(), &zero_pi),
+        ] {
+            let ch = (
+                BlsScalar::random(&mut rng),
+                beta,
+                BlsScalar::random(&mut rng),
+                BlsScalar::random(&mut rng),
+                BlsScalar::random(&mut rng),
+                BlsScalar::random(&mut rng),
+                BlsScalar::random(&mut rng),
+            );
+            let gpu_res = cache.compute_split_quotient_raw_iffts_gpu(
+                &domain,
+                &z_p,
+                (&a_p, &b_p, &c_p, &d_p),
+                pi_ref,
+                &ch,
+            );
+            let cpu_res = cache.compute_split_quotient_raw_iffts_cpu(
+                &domain,
+                &z_p,
+                (&a_p, &b_p, &c_p, &d_p),
+                pi_ref,
+                &ch,
+            );
+            assert_eq!(
+                gpu_res,
+                cpu_res,
+                "GPU full quotient IFFTs mismatch CPU (beta_zero={})",
+                beta == BlsScalar::zero()
             );
         }
     }

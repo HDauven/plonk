@@ -1875,12 +1875,576 @@ L_BR_ST_LOOP:
     let _ = writeln!(out, "    ret;\n}}");
 }
 
+/// Emit a register-only `.func fr_mul_val` (`.reg` state-space parameters,
+/// 0 bytes `.local`, 0 pointers) used by `quotient_eval_wave` so `ptxas`
+/// compiles the full 6-widget quotient kernel in `< 0.1s`.
+fn emit_fr_mul_val_func(out: &mut String) {
+    let _ = writeln!(
+        out,
+        r#"
+.func (
+    .reg .u64 %r0, .reg .u64 %r1, .reg .u64 %r2, .reg .u64 %r3
+) fr_mul_val(
+    .reg .u64 %a0, .reg .u64 %a1, .reg .u64 %a2, .reg .u64 %a3,
+    .reg .u64 %b0, .reg .u64 %b1, .reg .u64 %b2, .reg .u64 %b3
+)
+{{"#
+    );
+    emit_fr_scratch_decls(out);
+    emit_fr_mul(out, "r", "a", "b");
+    let _ = writeln!(out, "    ret;\n}}");
+}
+
+fn emit_fr_mul_call(out: &mut String, dst: &str, a: &str, b: &str) {
+    let _ = writeln!(
+        out,
+        "    call (%{dst}0, %{dst}1, %{dst}2, %{dst}3), fr_mul_val, (\
+         %{a}0, %{a}1, %{a}2, %{a}3, %{b}0, %{b}1, %{b}2, %{b}3);"
+    );
+}
+
+fn emit_fr_is_zero(out: &mut String, pred: &str, a: &str) {
+    let _ = writeln!(
+        out,
+        "    or.b64 %ft0, %{a}0, %{a}1;\n    \
+         or.b64 %ft1, %{a}2, %{a}3;\n    \
+         or.b64 %ft0, %ft0, %ft1;\n    \
+         setp.eq.u64 %{pred}, %ft0, 0;"
+    );
+}
+
+fn emit_fr_set_zero(out: &mut String, dst: &str) {
+    for i in 0..4 {
+        let _ = writeln!(out, "    mov.u64 %{dst}{i}, 0;");
+    }
+}
+
+/// Load challenge `idx` from `p_ch` (`[FastFr; 44]`) into register bank `dst`.
+fn emit_ch_load(out: &mut String, dst: &str, idx: usize) {
+    emit_fr_load(out, "global", dst, "ch_p", idx * 32);
+}
+
+/// Load selector `sel_idx` (`0..17`) at flat offset `%sel_off` (`(k*n + j) * 32`)
+/// into register bank `dst` using `%addr` as scratch.
+fn emit_sel_load(out: &mut String, dst: &str, sel_idx: usize) {
+    let _ = writeln!(
+        out,
+        "    ld.global.u64 %addr, [%sel_ptrs + {}];\n    \
+         add.u64 %addr, %addr, %sel_off;",
+        sel_idx * 8
+    );
+    emit_fr_load(out, "global", dst, "addr", 0);
+}
+
+/// `dst = delta(f) = (f*(f - 3)) * (f*(f - 3) + 2)` using `tmp` as scratch.
+fn emit_fr_delta(out: &mut String, dst: &str, f: &str, tmp: &str) {
+    emit_ch_load(out, tmp, 15); // three
+    emit_fr_sub(out, tmp, f, tmp);
+    emit_fr_mul_call(out, dst, f, tmp);
+    emit_ch_load(out, tmp, 14); // two
+    emit_fr_add(out, tmp, dst, tmp);
+    emit_fr_mul_call(out, dst, dst, tmp);
+}
+
+/// Emit `quotient_eval_wave`: evaluates ALL 6 Dusk PLONK widgets (arithmetic,
+/// range, logic, fixed-base ECC, variable-base ECC, permutation + L_1) and
+/// divides by `v_H` for 4 cosets (`4 * n` points in parallel) directly in VRAM!
+fn emit_quotient_eval_kernel(out: &mut String) {
+    let _ = writeln!(
+        out,
+        r#"
+.visible .entry quotient_eval_wave(
+    .param .u64 p_wave_evals,
+    .param .u64 p_sel_ptrs,
+    .param .u64 p_ch,
+    .param .u64 p_q_out,
+    .param .u32 p_n,
+    .param .u32 p_log_n,
+    .param .u32 p_k_base,
+    .param .u32 p_num_polys
+)
+{{
+    .reg .u32 %tid_g, %r_ctaid, %r_ntid, %n, %log_n, %k_base, %npolys, %total_pts;
+    .reg .u32 %local_k, %coset_k, %j, %jw, %mask, %base_p, %idx;
+    .reg .u64 %wev, %sel_ptrs, %ch_p, %q_out, %off, %sel_off, %addr, %sp, %has_ib;
+    .reg .u64 %ra<4>, %rb<4>, %rc<4>, %rd<4>, %raw<4>, %rbw<4>, %rdw<4>;
+    .reg .u64 %rt<4>, %rab<4>, %rx<4>, %ry<4>, %rz<4>, %rp<4>, %rq<4>, %rs<4>, %ru<4>, %rv<4>, %rw<4>;
+    .reg .pred %oob, %pz, %p_has;"#
+    );
+    emit_fr_scratch_decls(out);
+    let _ = writeln!(
+        out,
+        r#"
+    mov.u32 %r_ctaid, %ctaid.x;
+    mov.u32 %r_ntid, %ntid.x;
+    mov.u32 %tid_g, %tid.x;
+    mad.lo.u32 %tid_g, %r_ctaid, %r_ntid, %tid_g;
+
+    ld.param.u32 %n, [p_n];
+    shl.b32 %total_pts, %n, 2;
+    setp.ge.u32 %oob, %tid_g, %total_pts;
+    @%oob ret;
+
+    ld.param.u64 %wev, [p_wave_evals];
+    ld.param.u64 %sel_ptrs, [p_sel_ptrs];
+    ld.param.u64 %ch_p, [p_ch];
+    ld.param.u64 %q_out, [p_q_out];
+    ld.param.u32 %log_n, [p_log_n];
+    ld.param.u32 %k_base, [p_k_base];
+    ld.param.u32 %npolys, [p_num_polys];
+
+    shr.u32 %local_k, %tid_g, %log_n;
+    add.u32 %coset_k, %k_base, %local_k;
+    sub.u32 %mask, %n, 1;
+    and.b32 %j, %tid_g, %mask;
+    add.u32 %jw, %j, 1;
+    and.b32 %jw, %jw, %mask;
+
+    // Flat byte offset into `8 * n` selector arrays: `(coset_k * n + j) * 32`.
+    shl.b32 %idx, %coset_k, %log_n;
+    add.u32 %idx, %idx, %j;
+    mul.wide.u32 %sel_off, %idx, 32;
+
+    // Load wire evaluations `a, b, c, d` at `j` and `a_w, b_w, d_w` at `j_w`.
+    // Layout in `wev`: polynomial `(local_k * npolys + p)` is `[z, a, b, c, d, (pi)]`.
+    mul.lo.u32 %base_p, %local_k, %npolys;"#
+    );
+
+    // Helper closure to load wave poly `(base_p + p_off)` at index reg (`%j` or `%jw`)
+    let load_wave_poly =
+        |out: &mut String, dst: &str, p_off: u32, idx_reg: &str| {
+            let _ = writeln!(
+                out,
+                "    add.u32 %idx, %base_p, {p_off};\n    \
+             shl.b32 %idx, %idx, %log_n;\n    \
+             add.u32 %idx, %idx, %{idx_reg};\n    \
+             mul.wide.u32 %off, %idx, 32;\n    \
+             add.u64 %addr, %wev, %off;"
+            );
+            emit_fr_load(out, "global", dst, "addr", 0);
+        };
+
+    load_wave_poly(out, "ra", 1, "j");
+    load_wave_poly(out, "rb", 2, "j");
+    load_wave_poly(out, "rc", 3, "j");
+    load_wave_poly(out, "rd", 4, "j");
+    load_wave_poly(out, "raw", 1, "jw");
+    load_wave_poly(out, "rbw", 2, "jw");
+    load_wave_poly(out, "rdw", 4, "jw");
+
+    emit_fr_set_zero(out, "rt");
+    emit_fr_mul_call(out, "rab", "ra", "rb");
+
+    // 1. Arithmetic widget (`q_arith` = sel[6])
+    emit_sel_load(out, "rp", 6);
+    emit_fr_is_zero(out, "pz", "rp");
+    let _ = writeln!(out, "    @%pz bra L_Q_RANGE;");
+    emit_sel_load(out, "rx", 0); // q_m
+    emit_fr_mul_call(out, "rx", "rab", "rx");
+    emit_sel_load(out, "ry", 1); // q_l
+    emit_fr_mul_call(out, "ry", "ra", "ry");
+    emit_fr_add(out, "rx", "rx", "ry");
+    emit_sel_load(out, "ry", 2); // q_r
+    emit_fr_mul_call(out, "ry", "rb", "ry");
+    emit_fr_add(out, "rx", "rx", "ry");
+    emit_sel_load(out, "ry", 3); // q_o
+    emit_fr_mul_call(out, "ry", "rc", "ry");
+    emit_fr_add(out, "rx", "rx", "ry");
+    emit_sel_load(out, "ry", 4); // q_f
+    emit_fr_mul_call(out, "ry", "rd", "ry");
+    emit_fr_add(out, "rx", "rx", "ry");
+    emit_sel_load(out, "ry", 5); // q_c
+    emit_fr_add(out, "rx", "rx", "ry");
+    emit_fr_mul_call(out, "rx", "rx", "rp");
+    emit_fr_add(out, "rt", "rt", "rx");
+
+    // 2. Range widget (`q_range` = sel[7], optional)
+    let _ = writeln!(
+        out,
+        "L_Q_RANGE:\n    ld.global.u64 %sp, [%sel_ptrs + 56];\n    \
+         setp.eq.u64 %pz, %sp, 0;\n    @%pz bra L_Q_LOGIC;\n    \
+         add.u64 %addr, %sp, %sel_off;"
+    );
+    emit_fr_load(out, "global", "rp", "addr", 0);
+    emit_fr_is_zero(out, "pz", "rp");
+    let _ = writeln!(out, "    @%pz bra L_Q_LOGIC;");
+    // b1 = delta(c - 4*d)
+    emit_fr_add(out, "ry", "rd", "rd");
+    emit_fr_add(out, "ry", "ry", "ry");
+    emit_fr_sub(out, "ry", "rc", "ry");
+    emit_fr_delta(out, "rx", "ry", "rz");
+    // b2 = delta(b - 4*c) * range_k1
+    emit_fr_add(out, "ry", "rc", "rc");
+    emit_fr_add(out, "ry", "ry", "ry");
+    emit_fr_sub(out, "ry", "rb", "ry");
+    emit_fr_delta(out, "ry", "ry", "rz");
+    emit_ch_load(out, "rz", 17);
+    emit_fr_mul_call(out, "ry", "ry", "rz");
+    emit_fr_add(out, "rx", "rx", "ry");
+    // b3 = delta(a - 4*b) * range_k2
+    emit_fr_add(out, "ry", "rb", "rb");
+    emit_fr_add(out, "ry", "ry", "ry");
+    emit_fr_sub(out, "ry", "ra", "ry");
+    emit_fr_delta(out, "ry", "ry", "rz");
+    emit_ch_load(out, "rz", 18);
+    emit_fr_mul_call(out, "ry", "ry", "rz");
+    emit_fr_add(out, "rx", "rx", "ry");
+    // b4 = delta(d_w - 4*a) * range_k3
+    emit_fr_add(out, "ry", "ra", "ra");
+    emit_fr_add(out, "ry", "ry", "ry");
+    emit_fr_sub(out, "ry", "rdw", "ry");
+    emit_fr_delta(out, "ry", "ry", "rz");
+    emit_ch_load(out, "rz", 19);
+    emit_fr_mul_call(out, "ry", "ry", "rz");
+    emit_fr_add(out, "rx", "rx", "ry");
+    // t_1 += rsum * q_range * range_ch
+    emit_fr_mul_call(out, "rx", "rx", "rp");
+    emit_ch_load(out, "rz", 16);
+    emit_fr_mul_call(out, "rx", "rx", "rz");
+    emit_fr_add(out, "rt", "rt", "rx");
+
+    // 3. Logic widget (`q_logic` = sel[8], optional)
+    let _ = writeln!(
+        out,
+        "L_Q_LOGIC:\n    ld.global.u64 %sp, [%sel_ptrs + 64];\n    \
+         setp.eq.u64 %pz, %sp, 0;\n    @%pz bra L_Q_FIXED;\n    \
+         add.u64 %addr, %sp, %sel_off;"
+    );
+    emit_fr_load(out, "global", "rw", "addr", 0); // q_logic in %rw
+    emit_fr_is_zero(out, "pz", "rw");
+    let _ = writeln!(out, "    @%pz bra L_Q_FIXED;");
+    // rp = la = a_w - 4*a, rq = lb = b_w - 4*b, rs = ld = d_w - 4*d
+    emit_fr_add(out, "ry", "ra", "ra");
+    emit_fr_add(out, "ry", "ry", "ry");
+    emit_fr_sub(out, "rp", "raw", "ry");
+    emit_fr_add(out, "ry", "rb", "rb");
+    emit_fr_add(out, "ry", "ry", "ry");
+    emit_fr_sub(out, "rq", "rbw", "ry");
+    emit_fr_add(out, "ry", "rd", "rd");
+    emit_fr_add(out, "ry", "ry", "ry");
+    emit_fr_sub(out, "rs", "rdw", "ry");
+    // rx = c0 + c1 + c2 + c3
+    emit_fr_delta(out, "rx", "rp", "rz"); // c0
+    emit_fr_delta(out, "ry", "rq", "rz");
+    emit_ch_load(out, "rz", 21); // logic_k1
+    emit_fr_mul_call(out, "ry", "ry", "rz");
+    emit_fr_add(out, "rx", "rx", "ry");
+    emit_fr_delta(out, "ry", "rs", "rz");
+    emit_ch_load(out, "rz", 22); // logic_k2
+    emit_fr_mul_call(out, "ry", "ry", "rz");
+    emit_fr_add(out, "rx", "rx", "ry");
+    // ru = la * lb; c3 = (c - la_lb) * logic_k3
+    emit_fr_mul_call(out, "ru", "rp", "rq");
+    emit_fr_sub(out, "ry", "rc", "ru");
+    emit_ch_load(out, "rz", 23); // logic_k3
+    emit_fr_mul_call(out, "ry", "ry", "rz");
+    emit_fr_add(out, "rx", "rx", "ry");
+    // delta_xor_and:
+    // rv = apb = la + lb; rp = apb_sq = apb * apb; rq = sq_sum = apb_sq - 2*la_lb
+    emit_fr_add(out, "rv", "rp", "rq");
+    emit_fr_mul_call(out, "rp", "rv", "rv");
+    emit_fr_add(out, "ru", "ru", "ru");
+    emit_fr_sub(out, "rq", "rp", "ru"); // sq_sum
+    // rq = eighteen_sq_sum = 2 * (8 * sq_sum + sq_sum)
+    emit_fr_add(out, "ru", "rq", "rq");
+    emit_fr_add(out, "ru", "ru", "ru");
+    emit_fr_add(out, "ru", "ru", "ru");
+    emit_fr_add(out, "rq", "ru", "rq");
+    emit_fr_add(out, "rq", "rq", "rq");
+    // rv = three_apb = 2*apb + apb
+    emit_fr_add(out, "ru", "rv", "rv");
+    emit_fr_add(out, "rv", "ru", "rv");
+    // ru = nine_apb = 2*three_apb + three_apb; ry = eighteen_apb = 2*nine_apb
+    emit_fr_add(out, "ru", "rv", "rv");
+    emit_fr_add(out, "ru", "ru", "rv");
+    emit_fr_add(out, "ry", "ru", "ru"); // eighteen_apb
+    // rp = eighty_one_apb = 3 * (eighteen_apb + nine_apb)
+    emit_fr_add(out, "rp", "ry", "ru");
+    emit_fr_add(out, "rz", "rp", "rp");
+    emit_fr_add(out, "rp", "rz", "rp");
+    // inner0 = 4*c - eighteen_apb + 81
+    emit_fr_add(out, "ru", "rc", "rc");
+    emit_fr_add(out, "ru", "ru", "ru");
+    emit_fr_sub(out, "ru", "ru", "ry");
+    emit_ch_load(out, "rz", 25); // 81
+    emit_fr_add(out, "ru", "ru", "rz");
+    // inner1 = c * inner0 + eighteen_sq_sum
+    emit_fr_mul_call(out, "ru", "rc", "ru");
+    emit_fr_add(out, "ru", "ru", "rq");
+    // f_inner = inner1 - eighty_one_apb + 83
+    emit_fr_sub(out, "ru", "ru", "rp");
+    emit_ch_load(out, "rz", 26); // 83
+    emit_fr_add(out, "ru", "ru", "rz");
+    // f_val = c * f_inner; 2*f_val in ru
+    emit_fr_mul_call(out, "ru", "rc", "ru");
+    emit_fr_add(out, "ru", "ru", "ru");
+    // rp = three_c = 3*ld; rq = nine_c = 3*three_c
+    emit_fr_add(out, "rp", "rs", "rs");
+    emit_fr_add(out, "rp", "rp", "rs");
+    emit_fr_add(out, "rq", "rp", "rp");
+    emit_fr_add(out, "rq", "rq", "rp");
+    // e_val = (three_apb + three_c) - 2*f_val (in ry)
+    emit_fr_add(out, "ry", "rv", "rp");
+    emit_fr_sub(out, "ry", "ry", "ru");
+    // b_val = q_c * (nine_c - three_apb) (in rz)
+    emit_fr_sub(out, "rz", "rq", "rv");
+    emit_sel_load(out, "rp", 5); // q_c
+    emit_fr_mul_call(out, "rz", "rp", "rz");
+    // c4 = (b_val + e_val) * logic_k4
+    emit_fr_add(out, "ry", "rz", "ry");
+    emit_ch_load(out, "rz", 24); // logic_k4
+    emit_fr_mul_call(out, "ry", "ry", "rz");
+    // t_1 += (l_sum * q_logic) * logic_ch
+    emit_fr_add(out, "rx", "rx", "ry");
+    emit_fr_mul_call(out, "rx", "rw", "rx");
+    emit_ch_load(out, "rz", 20); // logic_ch
+    emit_fr_mul_call(out, "rx", "rx", "rz");
+    emit_fr_add(out, "rt", "rt", "rx");
+
+    // 4. Fixed-base ECC widget (`q_fixed` = sel[9], optional)
+    let _ = writeln!(
+        out,
+        "L_Q_FIXED:\n    ld.global.u64 %sp, [%sel_ptrs + 72];\n    \
+         setp.eq.u64 %pz, %sp, 0;\n    @%pz bra L_Q_VAR;\n    \
+         add.u64 %addr, %sp, %sel_off;"
+    );
+    emit_fr_load(out, "global", "rw", "addr", 0); // q_fixed
+    emit_fr_is_zero(out, "pz", "rw");
+    let _ = writeln!(out, "    @%pz bra L_Q_VAR;");
+    // rp = bit = d_w - 2*d; rq = bit^2; rx = bit * (bit^2 - 1)
+    emit_fr_add(out, "ry", "rd", "rd");
+    emit_fr_sub(out, "rp", "rdw", "ry");
+    emit_fr_mul_call(out, "rq", "rp", "rp");
+    emit_ch_load(out, "rv", 13); // one
+    emit_fr_sub(out, "ry", "rq", "rv");
+    emit_fr_mul_call(out, "rx", "rp", "ry");
+    // rs = y_alpha = bit_sq * (q_r - 1) + 1
+    emit_sel_load(out, "ry", 2); // q_r
+    emit_fr_sub(out, "ry", "ry", "rv");
+    emit_fr_mul_call(out, "rs", "rq", "ry");
+    emit_fr_add(out, "rs", "rs", "rv");
+    // ru = x_alpha = bit * q_l
+    emit_sel_load(out, "ry", 1); // q_l
+    emit_fr_mul_call(out, "ru", "rp", "ry");
+    // xy_cons = (bit * q_c - c) * fixed_k1
+    emit_sel_load(out, "ry", 5); // q_c
+    emit_fr_mul_call(out, "ry", "rp", "ry");
+    emit_fr_sub(out, "ry", "ry", "rc");
+    emit_ch_load(out, "rz", 28); // fixed_k1
+    emit_fr_mul_call(out, "ry", "ry", "rz");
+    emit_fr_add(out, "rx", "rx", "ry");
+    // rv = d_term = (c * ab) * edwards_d
+    emit_fr_mul_call(out, "rv", "rc", "rab");
+    emit_ch_load(out, "rz", 31); // edwards_d
+    emit_fr_mul_call(out, "rv", "rv", "rz");
+    // x_cons = ((a_w + a_w * d_term) - (a * y_alpha + b * x_alpha)) * fixed_k2
+    emit_fr_mul_call(out, "ry", "raw", "rv");
+    emit_fr_add(out, "ry", "raw", "ry");
+    emit_fr_mul_call(out, "rz", "ra", "rs");
+    emit_fr_mul_call(out, "rp", "rb", "ru");
+    emit_fr_add(out, "rz", "rz", "rp");
+    emit_fr_sub(out, "ry", "ry", "rz");
+    emit_ch_load(out, "rz", 29); // fixed_k2
+    emit_fr_mul_call(out, "ry", "ry", "rz");
+    emit_fr_add(out, "rx", "rx", "ry");
+    // y_cons = ((b_w - b_w * d_term) - (b * y_alpha + a * x_alpha)) * fixed_k3
+    emit_fr_mul_call(out, "ry", "rbw", "rv");
+    emit_fr_sub(out, "ry", "rbw", "ry");
+    emit_fr_mul_call(out, "rz", "rb", "rs");
+    emit_fr_mul_call(out, "rp", "ra", "ru");
+    emit_fr_add(out, "rz", "rz", "rp");
+    emit_fr_sub(out, "ry", "ry", "rz");
+    emit_ch_load(out, "rz", 30); // fixed_k3
+    emit_fr_mul_call(out, "ry", "ry", "rz");
+    emit_fr_add(out, "rx", "rx", "ry");
+    // t_1 += id * q_fixed * fixed_ch
+    emit_fr_mul_call(out, "rx", "rx", "rw");
+    emit_ch_load(out, "rz", 27); // fixed_ch
+    emit_fr_mul_call(out, "rx", "rx", "rz");
+    emit_fr_add(out, "rt", "rt", "rx");
+
+    // 5. Variable-base ECC widget (`q_var` = sel[10], optional)
+    let _ = writeln!(
+        out,
+        "L_Q_VAR:\n    ld.global.u64 %sp, [%sel_ptrs + 80];\n    \
+         setp.eq.u64 %pz, %sp, 0;\n    @%pz bra L_Q_PI;\n    \
+         add.u64 %addr, %sp, %sel_off;"
+    );
+    emit_fr_load(out, "global", "rw", "addr", 0); // q_var
+    emit_fr_is_zero(out, "pz", "rw");
+    let _ = writeln!(out, "    @%pz bra L_Q_PI;");
+    // rx = xy_cons = a * d - d_w
+    emit_fr_mul_call(out, "rx", "ra", "rd");
+    emit_fr_sub(out, "rx", "rx", "rdw");
+    // rp = y1_x2 = b * c; rq = y1_y2 = b * d; rs = x1_x2 = a * c
+    emit_fr_mul_call(out, "rp", "rb", "rc");
+    emit_fr_mul_call(out, "rq", "rb", "rd");
+    emit_fr_mul_call(out, "rs", "ra", "rc");
+    // ru = d_prod = (edwards_d * d_w) * y1_x2
+    emit_ch_load(out, "rz", 31); // edwards_d
+    emit_fr_mul_call(out, "ru", "rz", "rdw");
+    emit_fr_mul_call(out, "ru", "ru", "rp");
+    // x3_cons = ((d_w + y1_x2) - (a_w + a_w * d_prod)) * var_k1
+    emit_fr_add(out, "ry", "rdw", "rp");
+    emit_fr_mul_call(out, "rz", "raw", "ru");
+    emit_fr_add(out, "rz", "raw", "rz");
+    emit_fr_sub(out, "ry", "ry", "rz");
+    emit_ch_load(out, "rz", 33); // var_k1
+    emit_fr_mul_call(out, "ry", "ry", "rz");
+    emit_fr_add(out, "rx", "rx", "ry");
+    // y3_cons = ((y1_y2 + x1_x2) - (b_w - b_w * d_prod)) * var_k2
+    emit_fr_add(out, "ry", "rq", "rs");
+    emit_fr_mul_call(out, "rz", "rbw", "ru");
+    emit_fr_sub(out, "rz", "rbw", "rz");
+    emit_fr_sub(out, "ry", "ry", "rz");
+    emit_ch_load(out, "rz", 34); // var_k2
+    emit_fr_mul_call(out, "ry", "ry", "rz");
+    emit_fr_add(out, "rx", "rx", "ry");
+    // t_1 += id * q_var * var_ch
+    emit_fr_mul_call(out, "rx", "rx", "rw");
+    emit_ch_load(out, "rz", 32); // var_ch
+    emit_fr_mul_call(out, "rx", "rx", "rz");
+    emit_fr_add(out, "rt", "rt", "rx");
+
+    // 6. Public inputs (`pi_ev`, present iff `npolys == 6`)
+    let _ = writeln!(
+        out,
+        "L_Q_PI:\n    setp.eq.u32 %p_has, %npolys, 6;\n    @!%p_has bra L_Q_PERM;"
+    );
+    load_wave_poly(out, "rx", 5, "j");
+    emit_fr_add(out, "rt", "rt", "rx");
+
+    // 7. Permutation widget + L_1 check (`raw, rbw, rdw, rab` are now free!)
+    let _ = writeln!(out, "L_Q_PERM:");
+    load_wave_poly(out, "raw", 0, "j"); // z_j
+    load_wave_poly(out, "rbw", 0, "jw"); // z_jw
+    emit_sel_load(out, "rdw", 15); // x = linear_evals[k*n + j]
+
+    let _ = writeln!(
+        out,
+        "    ld.global.u64 %has_ib, [%ch_p + {}];\n    \
+         setp.eq.u64 %pz, %has_ib, 0;\n    @%pz bra L_Q_PERM_NOINV;",
+        35 * 32
+    );
+    // Factored beta path (`has_inv_beta == true`)
+    emit_ch_load(out, "rp", 7); // inv_beta
+    emit_ch_load(out, "rq", 8); // gamma_over_beta
+    emit_fr_mul_call(out, "ra", "ra", "rp");
+    emit_fr_add(out, "ra", "ra", "rq"); // a_gb
+    emit_fr_mul_call(out, "rb", "rb", "rp");
+    emit_fr_add(out, "rb", "rb", "rq"); // b_gb
+    emit_fr_mul_call(out, "rc", "rc", "rp");
+    emit_fr_add(out, "rc", "rc", "rq"); // c_gb
+    emit_fr_mul_call(out, "rd", "rd", "rp");
+    emit_fr_add(out, "rd", "rd", "rq"); // d_gb
+    // id_term = (a_gb + x)(b_gb + k1*x)(c_gb + k2*x)(d_gb + k3*x) * z_j
+    emit_fr_add(out, "rx", "ra", "rdw");
+    emit_ch_load(out, "rz", 10); // k1
+    emit_fr_mul_call(out, "ry", "rz", "rdw");
+    emit_fr_add(out, "ry", "rb", "ry");
+    emit_fr_mul_call(out, "rx", "rx", "ry");
+    emit_ch_load(out, "rz", 11); // k2
+    emit_fr_mul_call(out, "ry", "rz", "rdw");
+    emit_fr_add(out, "ry", "rc", "ry");
+    emit_ch_load(out, "rz", 12); // k3
+    emit_fr_mul_call(out, "ru", "rz", "rdw");
+    emit_fr_add(out, "ru", "rd", "ru");
+    emit_fr_mul_call(out, "ry", "ry", "ru");
+    emit_fr_mul_call(out, "rx", "rx", "ry");
+    emit_fr_mul_call(out, "rx", "rx", "raw"); // id_term
+    // copy_term = (a_gb + s1)(b_gb + s2)(c_gb + s3)(d_gb + s4) * z_jw
+    emit_sel_load(out, "rz", 11);
+    emit_fr_add(out, "ry", "ra", "rz");
+    emit_sel_load(out, "rz", 12);
+    emit_fr_add(out, "ru", "rb", "rz");
+    emit_fr_mul_call(out, "ry", "ry", "ru");
+    emit_sel_load(out, "rz", 13);
+    emit_fr_add(out, "rv", "rc", "rz");
+    emit_sel_load(out, "rz", 14);
+    emit_fr_add(out, "ru", "rd", "rz");
+    emit_fr_mul_call(out, "rv", "rv", "ru");
+    emit_fr_mul_call(out, "ry", "ry", "rv");
+    emit_fr_mul_call(out, "ry", "ry", "rbw"); // copy_term
+    emit_fr_sub(out, "rx", "rx", "ry");
+    emit_ch_load(out, "rz", 9); // beta4_alpha
+    emit_fr_mul_call(out, "rx", "rx", "rz");
+    let _ = writeln!(out, "    bra L_Q_L1;");
+
+    // Unfactored beta == 0 fallback path
+    let _ = writeln!(out, "L_Q_PERM_NOINV:");
+    emit_ch_load(out, "rq", 6); // gamma
+    emit_fr_add(out, "ra", "ra", "rq");
+    emit_fr_add(out, "rb", "rb", "rq");
+    emit_fr_add(out, "rc", "rc", "rq");
+    emit_fr_add(out, "rd", "rd", "rq");
+    emit_ch_load(out, "rp", 2); // beta
+    emit_fr_mul_call(out, "ry", "rp", "rdw");
+    emit_fr_add(out, "rx", "ra", "ry");
+    emit_ch_load(out, "rz", 3); // beta_k1
+    emit_fr_mul_call(out, "ry", "rz", "rdw");
+    emit_fr_add(out, "ry", "rb", "ry");
+    emit_fr_mul_call(out, "rx", "rx", "ry");
+    emit_ch_load(out, "rz", 4); // beta_k2
+    emit_fr_mul_call(out, "ry", "rz", "rdw");
+    emit_fr_add(out, "ry", "rc", "ry");
+    emit_ch_load(out, "rz", 5); // beta_k3
+    emit_fr_mul_call(out, "ru", "rz", "rdw");
+    emit_fr_add(out, "ru", "rd", "ru");
+    emit_fr_mul_call(out, "ry", "ry", "ru");
+    emit_fr_mul_call(out, "rx", "rx", "ry");
+    emit_fr_mul_call(out, "rx", "rx", "raw");
+    emit_sel_load(out, "rz", 11);
+    emit_fr_mul_call(out, "rz", "rp", "rz");
+    emit_fr_add(out, "ry", "ra", "rz");
+    emit_sel_load(out, "rz", 12);
+    emit_fr_mul_call(out, "rz", "rp", "rz");
+    emit_fr_add(out, "ru", "rb", "rz");
+    emit_fr_mul_call(out, "ry", "ry", "ru");
+    emit_sel_load(out, "rz", 13);
+    emit_fr_mul_call(out, "rz", "rp", "rz");
+    emit_fr_add(out, "rv", "rc", "rz");
+    emit_sel_load(out, "rz", 14);
+    emit_fr_mul_call(out, "rz", "rp", "rz");
+    emit_fr_add(out, "ru", "rd", "rz");
+    emit_fr_mul_call(out, "rv", "rv", "ru");
+    emit_fr_mul_call(out, "ry", "ry", "rv");
+    emit_fr_mul_call(out, "ry", "ry", "rbw");
+    emit_fr_sub(out, "rx", "rx", "ry");
+    emit_ch_load(out, "rz", 0); // alpha
+    emit_fr_mul_call(out, "rx", "rx", "rz");
+
+    // 8. L_1 check + vanishing_inv[coset_k] multiply + store to `q_out[coset_k*n + j]`
+    let _ = writeln!(out, "L_Q_L1:");
+    emit_sel_load(out, "ry", 16); // l1_evals
+    emit_ch_load(out, "rz", 1); // alpha_sq
+    emit_fr_mul_call(out, "ry", "ry", "rz");
+    emit_ch_load(out, "rz", 13); // one
+    emit_fr_sub(out, "rz", "raw", "rz"); // z_j - 1
+    emit_fr_mul_call(out, "ry", "rz", "ry");
+    emit_fr_add(out, "rx", "rx", "ry");
+    emit_fr_add(out, "rt", "rt", "rx");
+    // Load vanishing_inv[coset_k] from ch_p + (36 + coset_k) * 32
+    let _ = writeln!(
+        out,
+        "    add.u32 %idx, %coset_k, 36;\n    \
+         mul.wide.u32 %off, %idx, 32;\n    \
+         add.u64 %addr, %ch_p, %off;"
+    );
+    emit_fr_load(out, "global", "ry", "addr", 0);
+    emit_fr_mul_call(out, "rt", "rt", "ry");
+    let _ = writeln!(out, "    add.u64 %addr, %q_out, %sel_off;");
+    emit_fr_store(out, "global", "addr", 0, "rt");
+    let _ = writeln!(out, "    ret;\n}}");
+}
+
 /// Generate the complete PTX source module for BLS12-381 GPU MSM & NTT kernels.
 pub(crate) fn generate_msm_ptx() -> String {
-    let mut out = String::with_capacity(64 * 1024);
+    let mut out = String::with_capacity(80 * 1024);
     let _ = writeln!(out, ".version 7.5\n.target sm_70\n.address_size 64\n");
     emit_fp_mul_val_func(&mut out);
+    emit_fr_mul_val_func(&mut out);
     emit_msm_kernels(&mut out);
     emit_ntt_kernels(&mut out);
+    emit_quotient_eval_kernel(&mut out);
     out
 }
