@@ -176,7 +176,7 @@ impl Prover {
     /// if hiding degree = 1: (b2*X^(n+1) + b1*X^n - b2*X - b1) + witnesses
     /// if hiding degree = 2: (b3*X^(n+2) + b2*X^(n+1) + b1*X^n - b3*X^2 - b2*X
     /// - b1) + witnesses
-    #[cfg_attr(feature = "std", allow(dead_code))]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn blind_poly<R>(
         rng: &mut R,
         witnesses: &[BlsScalar],
@@ -739,99 +739,201 @@ impl Prover {
 
         let wire_blinders = Self::sample_wire_blinders(rng);
 
-        #[cfg(feature = "std")]
-        let [a_poly, b_poly, c_poly, d_poly] = {
-            let blinder_slices = [
-                &wire_blinders[..3],
-                &wire_blinders[3..6],
-                &wire_blinders[6..8],
-                &wire_blinders[8..],
-            ];
-            let witness_slices = [
-                a_scalars.as_slice(),
-                b_scalars.as_slice(),
-                c_scalars.as_slice(),
-                d_scalars.as_slice(),
-            ];
-            let blind_fast = |i: usize| {
-                let mut coeffs = crate::fast_fr::serial_ifft_bls_fast(
-                    witness_slices[i],
-                    &self.fast_cache.domain_ifft_roots,
-                    self.fast_cache.domain_size_inv,
-                    domain.log_size_of_group,
-                );
-                for (j, blinding_scalar) in
-                    blinder_slices[i].iter().copied().enumerate()
-                {
-                    coeffs[j] -= blinding_scalar;
-                    coeffs.push(blinding_scalar);
-                }
-                Polynomial::from_coefficients_vec(coeffs)
-            };
-            let ((a, b), (c, d)) = rayon::join(
-                || rayon::join(|| blind_fast(0), || blind_fast(1)),
-                || rayon::join(|| blind_fast(2), || blind_fast(3)),
-            );
-            [a, b, c, d]
-        };
-        #[cfg(not(feature = "std"))]
-        let [a_poly, b_poly, c_poly, d_poly] = Self::blind_wire_polynomials(
-            [&a_scalars, &b_scalars, &c_scalars, &d_scalars],
-            &wire_blinders,
-            &domain,
-        );
-        #[cfg(feature = "std")]
-        let t_wire_ifft = t_start.map(|_| std::time::Instant::now());
-
-        // commit to wire polynomials
-        // ([a(x)]_1, [b(x)]_1, [c(x)]_1, [d(x)]_1)
-        #[cfg(feature = "blst-backend")]
-        let [a_comm, b_comm, c_comm, d_comm] = {
-            #[cfg(feature = "gpu-cuda")]
-            let use_gpu_wires = size >= crate::gpu_cuda::GPU_MSM_MIN_LEN
-                && crate::gpu_cuda::is_gpu_available();
-            #[cfg(not(feature = "gpu-cuda"))]
-            let use_gpu_wires = false;
-
-            if !use_gpu_wires
-                && size + 3 <= self.blst_powers.len()
-                && a_poly.degree() <= self.commit_key.max_degree()
-                && b_poly.degree() <= self.commit_key.max_degree()
-                && c_poly.degree() <= self.commit_key.max_degree()
-                && d_poly.degree() <= self.commit_key.max_degree()
-            {
-                let lagrange_powers =
-                    self.blst_lagrange_powers.get_or_init(|| {
-                        crate::blst_backend::g1_ifft_blst(
-                            &self.blst_powers[..size],
-                            &domain,
-                        )
-                    });
+        #[cfg(feature = "gpu-cuda")]
+        let gpu_wire_fused = if size >= crate::gpu_cuda::GPU_MSM_MIN_LEN
+            && size + 3 <= self.blst_powers.len()
+            && size + 2 <= self.commit_key.max_degree()
+        {
+            if let Some(gpu_bases) = self.gpu_commit_bases() {
+                let witness_slices = [
+                    a_scalars.as_slice(),
+                    b_scalars.as_slice(),
+                    c_scalars.as_slice(),
+                    d_scalars.as_slice(),
+                ];
                 let blinder_slices = [
                     &wire_blinders[..3],
                     &wire_blinders[3..6],
                     &wire_blinders[6..8],
                     &wire_blinders[8..],
                 ];
-                let affines = crate::blst_backend::msm_g1_lagrange_batch(
-                    lagrange_powers,
-                    &self.blst_powers,
-                    [
-                        a_scalars.as_slice(),
-                        b_scalars.as_slice(),
-                        c_scalars.as_slice(),
-                        d_scalars.as_slice(),
-                    ],
-                    blinder_slices,
-                );
-                affines.map(Commitment::from)
+                self.fast_cache.with_ifft_batch_fast_fr(
+                    size,
+                    domain.log_size_of_group,
+                    witness_slices,
+                    |flat| {
+                        use crate::fast_fr::FastFr;
+                        use rayon::prelude::*;
+
+                        let fb: [FastFr; 11] =
+                            wire_blinders.map(|b| FastFr::from_bls(&b));
+                        let fb_slices: [&[FastFr]; 4] =
+                            [&fb[..3], &fb[3..6], &fb[6..8], &fb[8..]];
+                        for (i, bs) in fb_slices.iter().enumerate() {
+                            for (j, &b) in bs.iter().enumerate() {
+                                flat[i * size + j] =
+                                    flat[i * size + j].sub_portable(b);
+                            }
+                        }
+                        let (affs, polys) = gpu_bases
+                            .msm_batch_fast_fr_with_overlap(
+                                [
+                                    (&flat[0..size], fb_slices[0]),
+                                    (&flat[size..2 * size], fb_slices[1]),
+                                    (&flat[2 * size..3 * size], fb_slices[2]),
+                                    (&flat[3 * size..4 * size], fb_slices[3]),
+                                ],
+                                || {
+                                    let mut vecs: [Vec<BlsScalar>; 4] = [
+                                        vec![BlsScalar::zero(); size + 3],
+                                        vec![BlsScalar::zero(); size + 3],
+                                        vec![BlsScalar::zero(); size + 2],
+                                        vec![BlsScalar::zero(); size + 3],
+                                    ];
+                                    vecs.par_iter_mut().enumerate().for_each(
+                                        |(i, dst)| {
+                                            let src =
+                                                &flat[i * size..(i + 1) * size];
+                                            dst[..size]
+                                                .par_chunks_mut(1024)
+                                                .zip(src.par_chunks(1024))
+                                                .for_each(|(d_ch, s_ch)| {
+                                                    for (d, v) in d_ch
+                                                        .iter_mut()
+                                                        .zip(s_ch.iter())
+                                                    {
+                                                        *d = v.to_bls();
+                                                    }
+                                                });
+                                            let bs = blinder_slices[i];
+                                            dst[size..size + bs.len()]
+                                                .copy_from_slice(bs);
+                                        },
+                                    );
+                                    vecs.map(Polynomial::from_coefficients_vec)
+                                },
+                            )?;
+                        Some((polys, affs.map(Commitment::from)))
+                    },
+                )
             } else {
-                self.commit_polynomials([&a_poly, &b_poly, &c_poly, &d_poly])?
+                None
             }
+        } else {
+            None
         };
-        #[cfg(not(feature = "blst-backend"))]
-        let [a_comm, b_comm, c_comm, d_comm] =
-            self.commit_polynomials([&a_poly, &b_poly, &c_poly, &d_poly])?;
+        #[cfg(not(feature = "gpu-cuda"))]
+        let gpu_wire_fused: Option<([Polynomial; 4], [Commitment; 4])> = None;
+
+        #[cfg_attr(not(feature = "std"), allow(unused_variables))]
+        let (
+            [a_poly, b_poly, c_poly, d_poly],
+            [a_comm, b_comm, c_comm, d_comm],
+            t_wire_ifft,
+        ) = if let Some((polys, comms)) = gpu_wire_fused {
+            #[cfg(feature = "std")]
+            let t_wi = t_start.map(|_| std::time::Instant::now());
+            #[cfg(not(feature = "std"))]
+            let t_wi = ();
+            (polys, comms, t_wi)
+        } else {
+            #[cfg(feature = "std")]
+            let [a_poly, b_poly, c_poly, d_poly] = {
+                let blinder_slices = [
+                    &wire_blinders[..3],
+                    &wire_blinders[3..6],
+                    &wire_blinders[6..8],
+                    &wire_blinders[8..],
+                ];
+                let witness_slices = [
+                    a_scalars.as_slice(),
+                    b_scalars.as_slice(),
+                    c_scalars.as_slice(),
+                    d_scalars.as_slice(),
+                ];
+                let blind_fast = |i: usize| {
+                    let mut coeffs = crate::fast_fr::serial_ifft_bls_fast(
+                        witness_slices[i],
+                        &self.fast_cache.domain_ifft_roots,
+                        self.fast_cache.domain_size_inv,
+                        domain.log_size_of_group,
+                    );
+                    for (j, blinding_scalar) in
+                        blinder_slices[i].iter().copied().enumerate()
+                    {
+                        coeffs[j] -= blinding_scalar;
+                        coeffs.push(blinding_scalar);
+                    }
+                    Polynomial::from_coefficients_vec(coeffs)
+                };
+                let ((a, b), (c, d)) = rayon::join(
+                    || rayon::join(|| blind_fast(0), || blind_fast(1)),
+                    || rayon::join(|| blind_fast(2), || blind_fast(3)),
+                );
+                [a, b, c, d]
+            };
+            #[cfg(not(feature = "std"))]
+            let [a_poly, b_poly, c_poly, d_poly] = Self::blind_wire_polynomials(
+                [&a_scalars, &b_scalars, &c_scalars, &d_scalars],
+                &wire_blinders,
+                &domain,
+            );
+            #[cfg(feature = "std")]
+            let t_wi = t_start.map(|_| std::time::Instant::now());
+            #[cfg(not(feature = "std"))]
+            let t_wi = ();
+
+            #[cfg(feature = "blst-backend")]
+            let comms = {
+                #[cfg(feature = "gpu-cuda")]
+                let use_gpu_wires = size >= crate::gpu_cuda::GPU_MSM_MIN_LEN
+                    && crate::gpu_cuda::is_gpu_available();
+                #[cfg(not(feature = "gpu-cuda"))]
+                let use_gpu_wires = false;
+
+                if !use_gpu_wires
+                    && size + 3 <= self.blst_powers.len()
+                    && a_poly.degree() <= self.commit_key.max_degree()
+                    && b_poly.degree() <= self.commit_key.max_degree()
+                    && c_poly.degree() <= self.commit_key.max_degree()
+                    && d_poly.degree() <= self.commit_key.max_degree()
+                {
+                    let lagrange_powers =
+                        self.blst_lagrange_powers.get_or_init(|| {
+                            crate::blst_backend::g1_ifft_blst(
+                                &self.blst_powers[..size],
+                                &domain,
+                            )
+                        });
+                    let blinder_slices = [
+                        &wire_blinders[..3],
+                        &wire_blinders[3..6],
+                        &wire_blinders[6..8],
+                        &wire_blinders[8..],
+                    ];
+                    let affines = crate::blst_backend::msm_g1_lagrange_batch(
+                        lagrange_powers,
+                        &self.blst_powers,
+                        [
+                            a_scalars.as_slice(),
+                            b_scalars.as_slice(),
+                            c_scalars.as_slice(),
+                            d_scalars.as_slice(),
+                        ],
+                        blinder_slices,
+                    );
+                    affines.map(Commitment::from)
+                } else {
+                    self.commit_polynomials([
+                        &a_poly, &b_poly, &c_poly, &d_poly,
+                    ])?
+                }
+            };
+            #[cfg(not(feature = "blst-backend"))]
+            let comms =
+                self.commit_polynomials([&a_poly, &b_poly, &c_poly, &d_poly])?;
+            ([a_poly, b_poly, c_poly, d_poly], comms, t_wi)
+        };
         #[cfg(feature = "std")]
         let t_wire_msm = t_start.map(|_| std::time::Instant::now());
 
@@ -863,27 +965,97 @@ impl Prover {
             .perm
             .compute_permutation_vec(&domain, wires, &beta, &gamma, sigma);
 
-        #[cfg(feature = "std")]
-        let z_poly = {
-            let blinders: [BlsScalar; 3] =
-                core::array::from_fn(|_| BlsScalar::random(&mut *rng));
-            let mut coeffs = crate::fast_fr::serial_ifft_bls_fast(
-                &permutation,
-                &self.fast_cache.domain_ifft_roots,
-                self.fast_cache.domain_size_inv,
-                domain.log_size_of_group,
-            );
-            for (j, blinding_scalar) in blinders.into_iter().enumerate() {
-                coeffs[j] -= blinding_scalar;
-                coeffs.push(blinding_scalar);
+        let z_blinders: [BlsScalar; 3] =
+            core::array::from_fn(|_| BlsScalar::random(&mut *rng));
+        #[cfg(feature = "gpu-cuda")]
+        let gpu_z_fused = if size >= crate::gpu_cuda::GPU_MSM_MIN_LEN
+            && size + 3 <= self.blst_powers.len()
+            && size + 2 <= self.commit_key.max_degree()
+        {
+            if let Some(gpu_bases) = self.gpu_commit_bases() {
+                self.fast_cache.with_ifft_batch_fast_fr(
+                    size,
+                    domain.log_size_of_group,
+                    [permutation.as_slice()],
+                    |flat| {
+                        use crate::fast_fr::FastFr;
+                        use rayon::prelude::*;
+
+                        let fb: [FastFr; 3] =
+                            z_blinders.map(|b| FastFr::from_bls(&b));
+                        for (j, &b) in fb.iter().enumerate() {
+                            flat[j] = flat[j].sub_portable(b);
+                        }
+                        let ([aff], z_poly) = gpu_bases
+                            .msm_batch_fast_fr_with_overlap(
+                                [(&flat[..size], &fb)],
+                                || {
+                                    let mut dst =
+                                        vec![BlsScalar::zero(); size + 3];
+                                    dst[..size]
+                                        .par_chunks_mut(1024)
+                                        .zip(flat[..size].par_chunks(1024))
+                                        .for_each(|(d_ch, s_ch)| {
+                                            for (d, v) in
+                                                d_ch.iter_mut().zip(s_ch.iter())
+                                            {
+                                                *d = v.to_bls();
+                                            }
+                                        });
+                                    dst[size..size + 3]
+                                        .copy_from_slice(&z_blinders);
+                                    Polynomial::from_coefficients_vec(dst)
+                                },
+                            )?;
+                        Some((z_poly, Commitment::from(aff)))
+                    },
+                )
+            } else {
+                None
             }
-            Polynomial::from_coefficients_vec(coeffs)
+        } else {
+            None
         };
-        #[cfg(not(feature = "std"))]
-        let z_poly = Self::blind_poly(rng, &permutation, 2, &domain);
-        #[cfg(feature = "std")]
-        let t_perm = t_start.map(|_| std::time::Instant::now());
-        let z_comm = self.commit_one(&z_poly)?;
+        #[cfg(not(feature = "gpu-cuda"))]
+        let gpu_z_fused: Option<(Polynomial, Commitment)> = None;
+
+        #[cfg_attr(not(feature = "std"), allow(unused_variables))]
+        let (z_poly, z_comm, t_perm) = if let Some((zp, zc)) = gpu_z_fused {
+            #[cfg(feature = "std")]
+            let tp = t_start.map(|_| std::time::Instant::now());
+            #[cfg(not(feature = "std"))]
+            let tp = ();
+            (zp, zc, tp)
+        } else {
+            #[cfg(feature = "std")]
+            let zp = {
+                let mut coeffs = crate::fast_fr::serial_ifft_bls_fast(
+                    &permutation,
+                    &self.fast_cache.domain_ifft_roots,
+                    self.fast_cache.domain_size_inv,
+                    domain.log_size_of_group,
+                );
+                for (j, blinding_scalar) in z_blinders.into_iter().enumerate() {
+                    coeffs[j] -= blinding_scalar;
+                    coeffs.push(blinding_scalar);
+                }
+                Polynomial::from_coefficients_vec(coeffs)
+            };
+            #[cfg(not(feature = "std"))]
+            let zp = Self::blind_poly_with_blinders(
+                &permutation,
+                &z_blinders,
+                &domain,
+                None,
+                false,
+            );
+            #[cfg(feature = "std")]
+            let tp = t_start.map(|_| std::time::Instant::now());
+            #[cfg(not(feature = "std"))]
+            let tp = ();
+            let zc = self.commit_one(&zp)?;
+            (zp, zc, tp)
+        };
         #[cfg(feature = "std")]
         let t_z_msm = t_start.map(|_| std::time::Instant::now());
         transcript.append_commitment(b"z_comm", &z_comm);
@@ -911,12 +1083,27 @@ impl Prover {
                 self.size,
             );
             #[cfg(feature = "std")]
-            let coeffs = crate::fast_fr::serial_ifft_bls_fast(
-                &dense_public_inputs,
-                &self.fast_cache.domain_ifft_roots,
-                self.fast_cache.domain_size_inv,
-                domain.log_size_of_group,
-            );
+            let coeffs = {
+                #[cfg(feature = "gpu-cuda")]
+                let gpu_pi = self.fast_cache.ifft_batch_gpu(
+                    size,
+                    domain.log_size_of_group,
+                    [dense_public_inputs.as_slice()],
+                    0,
+                );
+                #[cfg(not(feature = "gpu-cuda"))]
+                let gpu_pi: Option<[Vec<BlsScalar>; 1]> = None;
+                if let Some([c]) = gpu_pi {
+                    c
+                } else {
+                    crate::fast_fr::serial_ifft_bls_fast(
+                        &dense_public_inputs,
+                        &self.fast_cache.domain_ifft_roots,
+                        self.fast_cache.domain_size_inv,
+                        domain.log_size_of_group,
+                    )
+                }
+            };
             #[cfg(not(feature = "std"))]
             let coeffs = domain.ifft(&dense_public_inputs);
             Polynomial::from_coefficients_vec(coeffs)
@@ -933,74 +1120,121 @@ impl Prover {
             fixed_base_sep_challenge,
             var_base_sep_challenge,
         );
-        #[cfg(feature = "std")]
-        let [
-            mut t_low_vec,
-            mut t_mid_vec,
-            mut t_high_vec,
-            mut t_fourth_vec,
-        ] = self
-            .fast_cache
-            .compute_split_quotient(&domain, &z_poly, wires, &pi_poly, args)?;
-        #[cfg(not(feature = "std"))]
-        let [
-            mut t_low_vec,
-            mut t_mid_vec,
-            mut t_high_vec,
-            mut t_fourth_vec,
-        ] = {
-            let t_poly = quotient_poly::compute(
-                &self.quotient_domain,
-                &self.prover_key,
-                &z_poly,
-                wires,
-                &pi_poly,
-                &self.vanishing_coset_inverses,
-                args,
-            )?;
-            let domain_size = domain.size();
-            [
-                t_poly[0..domain_size].to_vec(),
-                t_poly[domain_size..2 * domain_size].to_vec(),
-                t_poly[2 * domain_size..3 * domain_size].to_vec(),
-                t_poly[3 * domain_size..].to_vec(),
-            ]
-        };
-        #[cfg(feature = "std")]
-        let t_quot = t_start.map(|_| std::time::Instant::now());
-
         // select 3 blinding factors for the quotient splitted polynomials
         let b_12 = BlsScalar::random(&mut *rng);
         let b_13 = BlsScalar::random(&mut *rng);
         let b_14 = BlsScalar::random(&mut *rng);
 
-        // t_low'(X) + b_12*X^n
-        t_low_vec.push(b_12);
+        #[cfg(feature = "gpu-cuda")]
+        let gpu_quot_fused = if size >= crate::gpu_cuda::GPU_MSM_MIN_LEN {
+            if let Some(gpu_bases) = self.gpu_commit_bases() {
+                match self.fast_cache.compute_and_commit_split_quotient_gpu(
+                    &domain,
+                    &z_poly,
+                    wires,
+                    &pi_poly,
+                    args,
+                    [b_12, b_13, b_14],
+                    gpu_bases,
+                    self.commit_key.max_degree(),
+                ) {
+                    Some(Ok((vecs, affs))) => Some((
+                        vecs.map(Polynomial::from_coefficients_vec),
+                        affs.map(Commitment::from),
+                    )),
+                    Some(Err(e)) => return Err(e),
+                    None => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        #[cfg(not(feature = "gpu-cuda"))]
+        let gpu_quot_fused: Option<([Polynomial; 4], [Commitment; 4])> = None;
 
-        // t_mid'(X) - b_12 + b_13*X^n
-        t_mid_vec[0] -= b_12;
-        t_mid_vec.push(b_13);
+        #[cfg_attr(not(feature = "std"), allow(unused_variables))]
+        let (
+            [t_low_poly, t_mid_poly, t_high_poly, t_fourth_poly],
+            [t_low_comm, t_mid_comm, t_high_comm, t_fourth_comm],
+            t_quot,
+        ) = if let Some((polys, comms)) = gpu_quot_fused {
+            #[cfg(feature = "std")]
+            let tq = t_start.map(|_| std::time::Instant::now());
+            #[cfg(not(feature = "std"))]
+            let tq = ();
+            (polys, comms, tq)
+        } else {
+            #[cfg(feature = "std")]
+            let [
+                mut t_low_vec,
+                mut t_mid_vec,
+                mut t_high_vec,
+                mut t_fourth_vec,
+            ] = self.fast_cache.compute_split_quotient(
+                &domain, &z_poly, wires, &pi_poly, args,
+            )?;
+            #[cfg(not(feature = "std"))]
+            let [
+                mut t_low_vec,
+                mut t_mid_vec,
+                mut t_high_vec,
+                mut t_fourth_vec,
+            ] = {
+                let t_poly = quotient_poly::compute(
+                    &self.quotient_domain,
+                    &self.prover_key,
+                    &z_poly,
+                    wires,
+                    &pi_poly,
+                    &self.vanishing_coset_inverses,
+                    args,
+                )?;
+                let domain_size = domain.size();
+                [
+                    t_poly[0..domain_size].to_vec(),
+                    t_poly[domain_size..2 * domain_size].to_vec(),
+                    t_poly[2 * domain_size..3 * domain_size].to_vec(),
+                    t_poly[3 * domain_size..].to_vec(),
+                ]
+            };
+            #[cfg(feature = "std")]
+            let tq = t_start.map(|_| std::time::Instant::now());
+            #[cfg(not(feature = "std"))]
+            let tq = ();
 
-        // t_high'(X) - b_13 + b_14*X^n
-        t_high_vec[0] -= b_13;
-        t_high_vec.push(b_14);
+            // t_low'(X) + b_12*X^n
+            t_low_vec.push(b_12);
 
-        // t_fourth'(X) - b_14
-        t_fourth_vec[0] -= b_14;
+            // t_mid'(X) - b_12 + b_13*X^n
+            t_mid_vec[0] -= b_12;
+            t_mid_vec.push(b_13);
 
-        let t_low_poly = Polynomial::from_coefficients_vec(t_low_vec);
-        let t_mid_poly = Polynomial::from_coefficients_vec(t_mid_vec);
-        let t_high_poly = Polynomial::from_coefficients_vec(t_high_vec);
-        let t_fourth_poly = Polynomial::from_coefficients_vec(t_fourth_vec);
+            // t_high'(X) - b_13 + b_14*X^n
+            t_high_vec[0] -= b_13;
+            t_high_vec.push(b_14);
 
-        // commit to split quotient polynomial
-        let [t_low_comm, t_mid_comm, t_high_comm, t_fourth_comm] = self
-            .commit_polynomials([
+            // t_fourth'(X) - b_14
+            t_fourth_vec[0] -= b_14;
+
+            let t_low_poly = Polynomial::from_coefficients_vec(t_low_vec);
+            let t_mid_poly = Polynomial::from_coefficients_vec(t_mid_vec);
+            let t_high_poly = Polynomial::from_coefficients_vec(t_high_vec);
+            let t_fourth_poly = Polynomial::from_coefficients_vec(t_fourth_vec);
+
+            let comms = self.commit_polynomials([
                 &t_low_poly,
                 &t_mid_poly,
                 &t_high_poly,
                 &t_fourth_poly,
             ])?;
+            (
+                [t_low_poly, t_mid_poly, t_high_poly, t_fourth_poly],
+                comms,
+                tq,
+            )
+        };
         #[cfg(feature = "std")]
         let t_quot_msm = t_start.map(|_| std::time::Instant::now());
 
@@ -1102,8 +1336,11 @@ impl Prover {
         let v_challenge = transcript.challenge_scalar(b"v_challenge");
         let v_w_challenge = transcript.challenge_scalar(b"v_w_challenge");
 
-        // compute linearization polynomial
-        let r_poly = linearization_poly::compute(
+        // Fuse the 16-term linearization polynomial `r(X)` directly into the
+        // `W_z(X)` aggregate opening witness (`v^0 = 1`), merging the 3
+        // overlapping selector terms (`q_l`, `q_r`, `q_c`) and skipping the
+        // constant `pi_eval` term (which Ruffini division by `X - z` discards).
+        let mut lin_terms = linearization_poly::compute_terms(
             &self.prover_key,
             &linearization_poly::LinearizationChallenges {
                 alpha,
@@ -1122,55 +1359,125 @@ impl Prover {
             &t_mid_poly,
             &t_high_poly,
             &t_fourth_poly,
-            &public_inputs,
         );
+        let v_pows = crate::util::powers_of(&v_challenge, 11);
+        // Merge overlapping selector terms from `W_z` into `lin_terms`:
+        // `lin_terms[1]` = q_l (+ v^10), `lin_terms[2]` = q_r (+ v^11),
+        // `lin_terms[5]` = q_c (+ v^9).
+        lin_terms[1].0 += v_pows[10];
+        lin_terms[2].0 += v_pows[11];
+        lin_terms[5].0 += v_pows[9];
 
-        let build_w_z = || {
-            // compute the opening proof polynomial 'W_z(X)'
-            CommitKey::compute_aggregate_witness(
-                &[
-                    &r_poly,
-                    &a_poly,
-                    &b_poly,
-                    &c_poly,
-                    &d_poly,
-                    &self.prover_key.permutation.s_sigma_1.0,
-                    &self.prover_key.permutation.s_sigma_2.0,
-                    &self.prover_key.permutation.s_sigma_3.0,
-                    // Bind selector evaluations (q_*) used inside the verifier
-                    // linearization commitment to their committed polynomials
-                    // by including them in the same batched opening at `z`.
-                    &self.prover_key.arithmetic.q_arith.0,
-                    &self.prover_key.arithmetic.q_c.0,
-                    &self.prover_key.arithmetic.q_l.0,
-                    &self.prover_key.arithmetic.q_r.0,
-                ],
-                &z_challenge,
-                &v_challenge,
-            )
+        let w_z_terms: [(BlsScalar, &Polynomial); 24] = [
+            lin_terms[0],
+            lin_terms[1],
+            lin_terms[2],
+            lin_terms[3],
+            lin_terms[4],
+            lin_terms[5],
+            lin_terms[6],
+            lin_terms[7],
+            lin_terms[8],
+            lin_terms[9],
+            lin_terms[10],
+            lin_terms[11],
+            lin_terms[12],
+            lin_terms[13],
+            lin_terms[14],
+            lin_terms[15],
+            (v_pows[1], &a_poly),
+            (v_pows[2], &b_poly),
+            (v_pows[3], &c_poly),
+            (v_pows[4], &d_poly),
+            (v_pows[5], &self.prover_key.permutation.s_sigma_1.0),
+            (v_pows[6], &self.prover_key.permutation.s_sigma_2.0),
+            (v_pows[7], &self.prover_key.permutation.s_sigma_3.0),
+            (v_pows[8], &self.prover_key.arithmetic.q_arith.0),
+        ];
+
+        #[cfg(feature = "gpu-cuda")]
+        let gpu_open_comms = if size >= crate::gpu_cuda::GPU_MSM_MIN_LEN {
+            if let Some(gpu_bases) = self.gpu_commit_bases() {
+                let raw_w_z: [(BlsScalar, &[BlsScalar]); 24] =
+                    w_z_terms.map(|(s, p)| (s, &p[..]));
+                let vw_pows = crate::util::powers_of(&v_w_challenge, 3);
+                let raw_w_zw: [(BlsScalar, &[BlsScalar]); 4] = [
+                    (vw_pows[0], &z_poly[..]),
+                    (vw_pows[1], &a_poly[..]),
+                    (vw_pows[2], &b_poly[..]),
+                    (vw_pows[3], &d_poly[..]),
+                ];
+                let (w_z_fast, w_zw_fast) = rayon::join(
+                    || {
+                        crate::fast_fr::poly_lincomb_and_ruffini_fast_fr(
+                            &raw_w_z,
+                            &z_challenge,
+                        )
+                    },
+                    || {
+                        crate::fast_fr::poly_lincomb_and_ruffini_fast_fr(
+                            &raw_w_zw,
+                            &z_w_challenge,
+                        )
+                    },
+                );
+                let max_deg = self.commit_key.max_degree();
+                let deg_z =
+                    w_z_fast.iter().rposition(|c| !c.is_zero()).unwrap_or(0);
+                let deg_zw =
+                    w_zw_fast.iter().rposition(|c| !c.is_zero()).unwrap_or(0);
+                if deg_z > max_deg
+                    || deg_zw > max_deg
+                    || w_z_fast.len() > self.blst_powers.len()
+                    || w_zw_fast.len() > self.blst_powers.len()
+                {
+                    return Err(Error::PolynomialDegreeTooLarge);
+                }
+                gpu_bases
+                    .msm_batch_fast_fr_with_overlap(
+                        [(&w_z_fast, &[]), (&w_zw_fast, &[])],
+                        || (),
+                    )
+                    .map(|(affs, ())| affs.map(Commitment::from))
+            } else {
+                None
+            }
+        } else {
+            None
         };
+        #[cfg(not(feature = "gpu-cuda"))]
+        let gpu_open_comms: Option<[Commitment; 2]> = None;
 
-        let build_w_zw = || {
-            // compute the shifted opening proof polynomial 'W_zw(X)'
-            CommitKey::compute_aggregate_witness(
-                &[&z_poly, &a_poly, &b_poly, &d_poly],
-                &z_w_challenge,
-                &v_w_challenge,
-            )
+        let [w_z_chall_comm, w_z_chall_w_comm] = if let Some(c) = gpu_open_comms
+        {
+            c
+        } else {
+            let build_w_z = || {
+                CommitKey::compute_weighted_witness(&w_z_terms, &z_challenge)
+            };
+
+            let build_w_zw = || {
+                // compute the shifted opening proof polynomial 'W_zw(X)'
+                CommitKey::compute_aggregate_witness(
+                    &[&z_poly, &a_poly, &b_poly, &d_poly],
+                    &z_w_challenge,
+                    &v_w_challenge,
+                )
+            };
+
+            #[cfg(feature = "std")]
+            let (aggregate_witness, shifted_aggregate_witness) =
+                rayon::join(build_w_z, build_w_zw);
+
+            #[cfg(not(feature = "std"))]
+            let (aggregate_witness, shifted_aggregate_witness) =
+                (build_w_z(), build_w_zw());
+
+            self.commit_polynomials([
+                &aggregate_witness,
+                &shifted_aggregate_witness,
+            ])?
         };
-
-        #[cfg(feature = "std")]
-        let (aggregate_witness, shifted_aggregate_witness) =
-            rayon::join(build_w_z, build_w_zw);
-
-        #[cfg(not(feature = "std"))]
-        let (aggregate_witness, shifted_aggregate_witness) =
-            (build_w_z(), build_w_zw());
-
-        let [w_z_chall_comm, w_z_chall_w_comm] = self.commit_polynomials([
-            &aggregate_witness,
-            &shifted_aggregate_witness,
-        ])?;
 
         #[cfg(feature = "std")]
         if let (

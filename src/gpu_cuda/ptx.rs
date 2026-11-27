@@ -784,6 +784,408 @@ L_SCT_NEXT:
 }}"#
     );
 
+    // Kernel 2a: msm_scan_blocks — per-block reduction of (entries, tasks, merges, tmps).
+    let _ = writeln!(
+        out,
+        r#"
+.visible .entry msm_scan_blocks(
+    .param .u64 p_counts,
+    .param .u64 p_block_totals,
+    .param .u32 p_total_buckets,
+    .param .u32 p_max_chunk
+)
+{{
+    .shared .align 4 .b8 sh_sb[4096];
+    .reg .u32 %t, %bid, %b, %tb, %mc, %c, %nt, %nm, %ntmp, %tmp, %stride, %peer;
+    .reg .u32 %pe, %ptk, %pmg, %ptp;
+    .reg .u64 %counts, %btot, %off, %addr, %sh_base, %sh_p, %sh_q;
+    .reg .pred %p_oob, %p0, %p1, %p_act, %p_loop, %is_t0;
+
+    mov.u32 %t, %tid.x;
+    mov.u32 %bid, %ctaid.x;
+    shl.b32 %b, %bid, 8;
+    add.u32 %b, %b, %t;
+
+    ld.param.u64 %counts, [p_counts];
+    ld.param.u64 %btot, [p_block_totals];
+    ld.param.u32 %tb, [p_total_buckets];
+    ld.param.u32 %mc, [p_max_chunk];
+
+    mov.u32 %c, 0;
+    mov.u32 %nt, 0;
+    mov.u32 %nm, 0;
+    mov.u32 %ntmp, 0;
+    setp.ge.u32 %p_oob, %b, %tb;
+    @%p_oob bra L_SB_STOR;
+    mul.wide.u32 %off, %b, 4;
+    add.u64 %addr, %counts, %off;
+    ld.global.u32 %c, [%addr];
+    setp.eq.u32 %p0, %c, 0;
+    @%p0 bra L_SB_STOR;
+    setp.le.u32 %p1, %c, %mc;
+    @!%p1 bra L_SB_SPLIT;
+    mov.u32 %nt, 1;
+    bra L_SB_STOR;
+L_SB_SPLIT:
+    add.u32 %tmp, %c, %mc;
+    sub.u32 %tmp, %tmp, 1;
+    div.u32 %nt, %tmp, %mc;
+    mov.u32 %nm, 1;
+    mov.u32 %ntmp, %nt;
+L_SB_STOR:
+    mov.u64 %sh_base, sh_sb;
+    mul.wide.u32 %off, %t, 4;
+    add.u64 %sh_p, %sh_base, %off;
+    st.shared.u32 [%sh_p + 0], %c;
+    st.shared.u32 [%sh_p + 1024], %nt;
+    st.shared.u32 [%sh_p + 2048], %nm;
+    st.shared.u32 [%sh_p + 3072], %ntmp;
+    bar.sync 0;
+
+    mov.u32 %stride, 128;
+L_SB_RED:
+    setp.eq.u32 %p_loop, %stride, 0;
+    @%p_loop bra L_SB_OUT;
+    setp.lt.u32 %p_act, %t, %stride;
+    @!%p_act bra L_SB_SYNC;
+    add.u32 %peer, %t, %stride;
+    mul.wide.u32 %off, %peer, 4;
+    add.u64 %sh_q, %sh_base, %off;
+    ld.shared.u32 %pe, [%sh_q + 0];
+    ld.shared.u32 %ptk, [%sh_q + 1024];
+    ld.shared.u32 %pmg, [%sh_q + 2048];
+    ld.shared.u32 %ptp, [%sh_q + 3072];
+    add.u32 %c, %c, %pe;
+    add.u32 %nt, %nt, %ptk;
+    add.u32 %nm, %nm, %pmg;
+    add.u32 %ntmp, %ntmp, %ptp;
+    st.shared.u32 [%sh_p + 0], %c;
+    st.shared.u32 [%sh_p + 1024], %nt;
+    st.shared.u32 [%sh_p + 2048], %nm;
+    st.shared.u32 [%sh_p + 3072], %ntmp;
+L_SB_SYNC:
+    bar.sync 0;
+    shr.u32 %stride, %stride, 1;
+    bra L_SB_RED;
+
+L_SB_OUT:
+    setp.eq.u32 %is_t0, %t, 0;
+    @!%is_t0 ret;
+    mul.wide.u32 %off, %bid, 16;
+    add.u64 %addr, %btot, %off;
+    st.global.u32 [%addr + 0], %c;
+    st.global.u32 [%addr + 4], %nt;
+    st.global.u32 [%addr + 8], %nm;
+    st.global.u32 [%addr + 12], %ntmp;
+    ret;
+}}
+
+// Kernel 2b: msm_scan_block_totals - single-block tiled exclusive scan over block totals.
+.visible .entry msm_scan_block_totals(
+    .param .u64 p_block_totals,
+    .param .u64 p_block_offsets,
+    .param .u64 p_totals_out,
+    .param .u32 p_num_blocks,
+    .param .u32 p_total_buckets
+)
+{{
+    .shared .align 4 .b8 sh_bt[4096];
+    .reg .u32 %t, %nb, %tb, %tile, %idx, %step, %peer;
+    .reg .u32 %re, %rtk, %rmg, %rtp;
+    .reg .u32 %ve, %vtk, %vmg, %vtp;
+    .reg .u32 %se, %stk, %smg, %stp;
+    .reg .u32 %pe, %ptk, %pmg, %ptp;
+    .reg .u64 %btot, %boff, %tout, %off, %addr, %sh_base, %sh_p, %sh_q;
+    .reg .pred %p_done, %p_in, %p_step, %p_ge, %is_t0;
+
+    mov.u32 %t, %tid.x;
+    ld.param.u64 %btot, [p_block_totals];
+    ld.param.u64 %boff, [p_block_offsets];
+    ld.param.u64 %tout, [p_totals_out];
+    ld.param.u32 %nb, [p_num_blocks];
+    ld.param.u32 %tb, [p_total_buckets];
+
+    mov.u64 %sh_base, sh_bt;
+    mul.wide.u32 %off, %t, 4;
+    add.u64 %sh_p, %sh_base, %off;
+
+    mov.u32 %re, 0;
+    mov.u32 %rtk, 0;
+    mov.u32 %rmg, 0;
+    mov.u32 %rtp, %tb;
+    mov.u32 %tile, 0;
+
+L_BT_TILE:
+    setp.ge.u32 %p_done, %tile, %nb;
+    @%p_done bra L_BT_FIN;
+
+    add.u32 %idx, %tile, %t;
+    mov.u32 %ve, 0;
+    mov.u32 %vtk, 0;
+    mov.u32 %vmg, 0;
+    mov.u32 %vtp, 0;
+    setp.lt.u32 %p_in, %idx, %nb;
+    @!%p_in bra L_BT_LD_DONE;
+    mul.wide.u32 %off, %idx, 16;
+    add.u64 %addr, %btot, %off;
+    ld.global.u32 %ve, [%addr + 0];
+    ld.global.u32 %vtk, [%addr + 4];
+    ld.global.u32 %vmg, [%addr + 8];
+    ld.global.u32 %vtp, [%addr + 12];
+L_BT_LD_DONE:
+    mov.u32 %se, %ve;
+    mov.u32 %stk, %vtk;
+    mov.u32 %smg, %vmg;
+    mov.u32 %stp, %vtp;
+    st.shared.u32 [%sh_p + 0], %se;
+    st.shared.u32 [%sh_p + 1024], %stk;
+    st.shared.u32 [%sh_p + 2048], %smg;
+    st.shared.u32 [%sh_p + 3072], %stp;
+    bar.sync 0;
+
+    mov.u32 %step, 1;
+L_BT_HS:
+    setp.ge.u32 %p_step, %step, 256;
+    @%p_step bra L_BT_WR;
+    mov.u32 %pe, 0;
+    mov.u32 %ptk, 0;
+    mov.u32 %pmg, 0;
+    mov.u32 %ptp, 0;
+    setp.ge.u32 %p_ge, %t, %step;
+    @!%p_ge bra L_BT_HS_SYNC;
+    sub.u32 %peer, %t, %step;
+    mul.wide.u32 %off, %peer, 4;
+    add.u64 %sh_q, %sh_base, %off;
+    ld.shared.u32 %pe, [%sh_q + 0];
+    ld.shared.u32 %ptk, [%sh_q + 1024];
+    ld.shared.u32 %pmg, [%sh_q + 2048];
+    ld.shared.u32 %ptp, [%sh_q + 3072];
+L_BT_HS_SYNC:
+    bar.sync 0;
+    add.u32 %se, %se, %pe;
+    add.u32 %stk, %stk, %ptk;
+    add.u32 %smg, %smg, %pmg;
+    add.u32 %stp, %stp, %ptp;
+    st.shared.u32 [%sh_p + 0], %se;
+    st.shared.u32 [%sh_p + 1024], %stk;
+    st.shared.u32 [%sh_p + 2048], %smg;
+    st.shared.u32 [%sh_p + 3072], %stp;
+    bar.sync 0;
+    shl.b32 %step, %step, 1;
+    bra L_BT_HS;
+
+L_BT_WR:
+    @!%p_in bra L_BT_ADV;
+    sub.u32 %pe, %se, %ve;
+    sub.u32 %ptk, %stk, %vtk;
+    sub.u32 %pmg, %smg, %vmg;
+    sub.u32 %ptp, %stp, %vtp;
+    add.u32 %pe, %pe, %re;
+    add.u32 %ptk, %ptk, %rtk;
+    add.u32 %pmg, %pmg, %rmg;
+    add.u32 %ptp, %ptp, %rtp;
+    mul.wide.u32 %off, %idx, 16;
+    add.u64 %addr, %boff, %off;
+    st.global.u32 [%addr + 0], %pe;
+    st.global.u32 [%addr + 4], %ptk;
+    st.global.u32 [%addr + 8], %pmg;
+    st.global.u32 [%addr + 12], %ptp;
+L_BT_ADV:
+    ld.shared.u32 %pe, [%sh_base + 1020];
+    ld.shared.u32 %ptk, [%sh_base + 2044];
+    ld.shared.u32 %pmg, [%sh_base + 3068];
+    ld.shared.u32 %ptp, [%sh_base + 4092];
+    add.u32 %re, %re, %pe;
+    add.u32 %rtk, %rtk, %ptk;
+    add.u32 %rmg, %rmg, %pmg;
+    add.u32 %rtp, %rtp, %ptp;
+    bar.sync 0;
+    add.u32 %tile, %tile, 256;
+    bra L_BT_TILE;
+
+L_BT_FIN:
+    setp.eq.u32 %is_t0, %t, 0;
+    @!%is_t0 ret;
+    st.global.u32 [%tout + 0], %re;
+    st.global.u32 [%tout + 4], %rtk;
+    st.global.u32 [%tout + 8], %rmg;
+    st.global.u32 [%tout + 12], %rtp;
+    ret;
+}}
+
+// Kernel 2c: msm_build_tasks - writes cursors, tasks, merges, and zeros empty
+// bucket `zz` limbs directly in VRAM (eliminating full buckets memset!).
+.visible .entry msm_build_tasks(
+    .param .u64 p_counts,
+    .param .u64 p_block_offsets,
+    .param .u64 p_cursors,
+    .param .u64 p_tasks,
+    .param .u64 p_merges,
+    .param .u64 p_buckets,
+    .param .u32 p_total_buckets,
+    .param .u32 p_max_chunk
+)
+{{
+    .shared .align 4 .b8 sh_mk[4096];
+    .reg .u32 %t, %bid, %b, %tb, %mc, %c, %nt, %nm, %ntmp, %tmp, %step, %peer;
+    .reg .u32 %se, %stk, %smg, %stp, %pe, %ptk, %pmg, %ptp;
+    .reg .u32 %start, %end_b, %t_off, %m_off, %tmp_off, %k, %sk, %ek, %dk;
+    .reg .u64 %counts, %boff, %cursors, %tasks, %merges, %buckets;
+    .reg .u64 %off, %addr, %sh_base, %sh_p, %sh_q;
+    .reg .pred %p_oob, %p0, %p1, %p_step, %p_ge, %p_kdone;
+
+    mov.u32 %t, %tid.x;
+    mov.u32 %bid, %ctaid.x;
+    shl.b32 %b, %bid, 8;
+    add.u32 %b, %b, %t;
+
+    ld.param.u64 %counts, [p_counts];
+    ld.param.u64 %boff, [p_block_offsets];
+    ld.param.u64 %cursors, [p_cursors];
+    ld.param.u64 %tasks, [p_tasks];
+    ld.param.u64 %merges, [p_merges];
+    ld.param.u64 %buckets, [p_buckets];
+    ld.param.u32 %tb, [p_total_buckets];
+    ld.param.u32 %mc, [p_max_chunk];
+
+    mov.u32 %c, 0;
+    mov.u32 %nt, 0;
+    mov.u32 %nm, 0;
+    mov.u32 %ntmp, 0;
+    setp.ge.u32 %p_oob, %b, %tb;
+    @%p_oob bra L_MK_STOR;
+    mul.wide.u32 %off, %b, 4;
+    add.u64 %addr, %counts, %off;
+    ld.global.u32 %c, [%addr];
+    setp.eq.u32 %p0, %c, 0;
+    @%p0 bra L_MK_STOR;
+    setp.le.u32 %p1, %c, %mc;
+    @!%p1 bra L_MK_SPLIT;
+    mov.u32 %nt, 1;
+    bra L_MK_STOR;
+L_MK_SPLIT:
+    add.u32 %tmp, %c, %mc;
+    sub.u32 %tmp, %tmp, 1;
+    div.u32 %nt, %tmp, %mc;
+    mov.u32 %nm, 1;
+    mov.u32 %ntmp, %nt;
+L_MK_STOR:
+    mov.u64 %sh_base, sh_mk;
+    mul.wide.u32 %off, %t, 4;
+    add.u64 %sh_p, %sh_base, %off;
+    mov.u32 %se, %c;
+    mov.u32 %stk, %nt;
+    mov.u32 %smg, %nm;
+    mov.u32 %stp, %ntmp;
+    st.shared.u32 [%sh_p + 0], %se;
+    st.shared.u32 [%sh_p + 1024], %stk;
+    st.shared.u32 [%sh_p + 2048], %smg;
+    st.shared.u32 [%sh_p + 3072], %stp;
+    bar.sync 0;
+
+    mov.u32 %step, 1;
+L_MK_HS:
+    setp.ge.u32 %p_step, %step, 256;
+    @%p_step bra L_MK_EMIT;
+    mov.u32 %pe, 0;
+    mov.u32 %ptk, 0;
+    mov.u32 %pmg, 0;
+    mov.u32 %ptp, 0;
+    setp.ge.u32 %p_ge, %t, %step;
+    @!%p_ge bra L_MK_HS_SYNC;
+    sub.u32 %peer, %t, %step;
+    mul.wide.u32 %off, %peer, 4;
+    add.u64 %sh_q, %sh_base, %off;
+    ld.shared.u32 %pe, [%sh_q + 0];
+    ld.shared.u32 %ptk, [%sh_q + 1024];
+    ld.shared.u32 %pmg, [%sh_q + 2048];
+    ld.shared.u32 %ptp, [%sh_q + 3072];
+L_MK_HS_SYNC:
+    bar.sync 0;
+    add.u32 %se, %se, %pe;
+    add.u32 %stk, %stk, %ptk;
+    add.u32 %smg, %smg, %pmg;
+    add.u32 %stp, %stp, %ptp;
+    st.shared.u32 [%sh_p + 0], %se;
+    st.shared.u32 [%sh_p + 1024], %stk;
+    st.shared.u32 [%sh_p + 2048], %smg;
+    st.shared.u32 [%sh_p + 3072], %stp;
+    bar.sync 0;
+    shl.b32 %step, %step, 1;
+    bra L_MK_HS;
+
+L_MK_EMIT:
+    @%p_oob ret;
+    mul.wide.u32 %off, %bid, 16;
+    add.u64 %addr, %boff, %off;
+    ld.global.u32 %pe, [%addr + 0];
+    ld.global.u32 %ptk, [%addr + 4];
+    ld.global.u32 %pmg, [%addr + 8];
+    ld.global.u32 %ptp, [%addr + 12];
+
+    sub.u32 %start, %se, %c;
+    add.u32 %start, %start, %pe;
+    sub.u32 %t_off, %stk, %nt;
+    add.u32 %t_off, %t_off, %ptk;
+    sub.u32 %m_off, %smg, %nm;
+    add.u32 %m_off, %m_off, %pmg;
+    sub.u32 %tmp_off, %stp, %ntmp;
+    add.u32 %tmp_off, %tmp_off, %ptp;
+
+    mul.wide.u32 %off, %b, 4;
+    add.u64 %addr, %cursors, %off;
+    st.global.u32 [%addr], %start;
+
+    setp.eq.u32 %p0, %c, 0;
+    @!%p0 bra L_MK_NONZERO;
+    mul.wide.u32 %off, %b, 192;
+    add.u64 %addr, %buckets, %off;
+    st.global.u64 [%addr + 96], 0;
+    st.global.u64 [%addr + 104], 0;
+    st.global.u64 [%addr + 112], 0;
+    st.global.u64 [%addr + 120], 0;
+    st.global.u64 [%addr + 128], 0;
+    st.global.u64 [%addr + 136], 0;
+    ret;
+
+L_MK_NONZERO:
+    add.u32 %end_b, %start, %c;
+    setp.le.u32 %p1, %c, %mc;
+    @!%p1 bra L_MK_MULTI;
+    mul.wide.u32 %off, %t_off, 12;
+    add.u64 %addr, %tasks, %off;
+    st.global.u32 [%addr + 0], %start;
+    st.global.u32 [%addr + 4], %end_b;
+    st.global.u32 [%addr + 8], %b;
+    ret;
+
+L_MK_MULTI:
+    mul.wide.u32 %off, %m_off, 12;
+    add.u64 %addr, %merges, %off;
+    st.global.u32 [%addr + 0], %b;
+    st.global.u32 [%addr + 4], %tmp_off;
+    st.global.u32 [%addr + 8], %nt;
+
+    mov.u32 %k, 0;
+    mov.u32 %sk, %start;
+L_MK_LOOP:
+    setp.ge.u32 %p_kdone, %k, %nt;
+    @%p_kdone ret;
+    add.u32 %ek, %sk, %mc;
+    min.u32 %ek, %ek, %end_b;
+    add.u32 %dk, %tmp_off, %k;
+    add.u32 %tmp, %t_off, %k;
+    mul.wide.u32 %off, %tmp, 12;
+    add.u64 %addr, %tasks, %off;
+    st.global.u32 [%addr + 0], %sk;
+    st.global.u32 [%addr + 4], %ek;
+    st.global.u32 [%addr + 8], %dk;
+    mov.u32 %sk, %ek;
+    add.u32 %k, %k, 1;
+    bra L_MK_LOOP;
+}}"#
+    );
+
     // Kernel 3: msm_accumulate_tasks (100% register-resident, load-balanced
     // sub-bucket chunking so no thread ever exceeds MAX_CHUNK point additions).
     // Each task is 12 bytes: `{ start: u32, end: u32, dst: u32 }`.
@@ -2435,6 +2837,189 @@ fn emit_quotient_eval_kernel(out: &mut String) {
     let _ = writeln!(out, "    add.u64 %addr, %q_out, %sel_off;");
     emit_fr_store(out, "global", "addr", 0, "rt");
     let _ = writeln!(out, "    ret;\n}}");
+
+    // Kernel: quotient_radix8_combine — performs the 8-point inverse DFT +
+    // coset inv_twiddle + gen_inv_t_scaled + gen_inv_sn directly in VRAM,
+    // writing `[t_low, t_mid, t_high, t_fourth[0..n], extra_v4[0..16]]`
+    // (halving DtoH bandwidth from 16 MB -> 8 MB at 2^16!) and setting atomic
+    // flags bit 0 (`v7 != 0`, unsatisfied) or bit 1 (`extra_tail` overflow).
+    let _ = writeln!(
+        out,
+        r#"
+.visible .entry quotient_radix8_combine(
+    .param .u64 p_iffts,
+    .param .u64 p_inv_twiddles,
+    .param .u64 p_gen_inv_t,
+    .param .u64 p_consts,
+    .param .u64 p_t_out,
+    .param .u64 p_flags,
+    .param .u32 p_n
+)
+{{
+    .reg .u32 %t, %r_ctaid, %r_ntid, %n, %idx, %dummy;
+    .reg .u64 %iffts, %inv_tw, %gen_t, %consts, %t_out, %flags, %off, %addr;
+    .reg .u64 %ra<4>, %rb<4>, %rc<4>, %rd<4>;
+    .reg .u64 %eva<4>, %evb<4>, %evc<4>, %evd<4>;
+    .reg .u64 %oda<4>, %odb<4>, %odc<4>, %odd<4>;
+    .reg .u64 %rw<4>, %rgt<4>, %rv<4>, %rsn<4>;
+    .reg .pred %oob, %pz, %p_lt16;"#
+    );
+    emit_fr_scratch_decls(out);
+    let _ = writeln!(
+        out,
+        r#"
+    mov.u32 %r_ctaid, %ctaid.x;
+    mov.u32 %r_ntid, %ntid.x;
+    mov.u32 %t, %tid.x;
+    mad.lo.u32 %t, %r_ctaid, %r_ntid, %t;
+
+    ld.param.u32 %n, [p_n];
+    setp.ge.u32 %oob, %t, %n;
+    @%oob ret;
+
+    ld.param.u64 %iffts, [p_iffts];
+    ld.param.u64 %inv_tw, [p_inv_twiddles];
+    ld.param.u64 %gen_t, [p_gen_inv_t];
+    ld.param.u64 %consts, [p_consts];
+    ld.param.u64 %t_out, [p_t_out];
+    ld.param.u64 %flags, [p_flags];"#
+    );
+
+    let emit_u_load = |out: &mut String, dst: &str, k: u32| {
+        if k == 0 {
+            let _ = writeln!(
+                out,
+                "    mul.wide.u32 %off, %t, 32;\n    add.u64 %addr, %iffts, %off;"
+            );
+            emit_fr_load(out, "global", dst, "addr", 0);
+        } else {
+            let _ = writeln!(
+                out,
+                "    mad.lo.u32 %idx, {k}, %n, %t;\n    mul.wide.u32 %off, %idx, 32;\n    add.u64 %addr, %iffts, %off;"
+            );
+            emit_fr_load(out, "global", dst, "addr", 0);
+            let tw_k = k - 1;
+            let _ = writeln!(
+                out,
+                "    mad.lo.u32 %idx, {tw_k}, %n, %t;\n    mul.wide.u32 %off, %idx, 32;\n    add.u64 %addr, %inv_tw, %off;"
+            );
+            emit_fr_load(out, "global", "rv", "addr", 0);
+            emit_fr_mul_call(out, dst, dst, "rv");
+        }
+    };
+
+    // Load w2 from consts[1] (+32)
+    emit_fr_load(out, "global", "rw", "consts", 32);
+
+    // Even 4-point DFT: u0, u4, u2, u6 -> eva, evb, evc, evd (ev0..ev3)
+    emit_u_load(out, "ra", 0);
+    emit_u_load(out, "rb", 4);
+    emit_fr_add(out, "rc", "ra", "rb"); // e0
+    emit_fr_sub(out, "rd", "ra", "rb"); // e1
+    emit_u_load(out, "ra", 2);
+    emit_u_load(out, "rb", 6);
+    emit_fr_add(out, "eva", "ra", "rb"); // e2 (temp)
+    emit_fr_sub(out, "evb", "ra", "rb");
+    emit_fr_mul_call(out, "evb", "evb", "rw"); // e3 = (u2 - u6) * w2
+    emit_fr_sub(out, "evc", "rc", "eva"); // ev2 = e0 - e2
+    emit_fr_add(out, "eva", "rc", "eva"); // ev0 = e0 + e2
+    emit_fr_sub(out, "evd", "rd", "evb"); // ev3 = e1 - e3
+    emit_fr_add(out, "evb", "rd", "evb"); // ev1 = e1 + e3
+
+    // Odd 4-point DFT: u1, u5, u3, u7 -> oda, odb, odc, odd (od0..od3)
+    emit_u_load(out, "ra", 1);
+    emit_u_load(out, "rb", 5);
+    emit_fr_add(out, "rc", "ra", "rb"); // o0
+    emit_fr_sub(out, "rd", "ra", "rb"); // o1
+    emit_u_load(out, "ra", 3);
+    emit_u_load(out, "rb", 7);
+    emit_fr_add(out, "oda", "ra", "rb"); // o2 (temp)
+    emit_fr_sub(out, "odb", "ra", "rb");
+    emit_fr_mul_call(out, "odb", "odb", "rw"); // o3 = (u3 - u7) * w2
+    emit_fr_sub(out, "odc", "rc", "oda");
+    emit_fr_mul_call(out, "odc", "odc", "rw"); // od2 = (o0 - o2) * w2
+    emit_fr_add(out, "oda", "rc", "oda"); // od0 = o0 + o2
+    emit_fr_add(out, "ra", "rd", "odb"); // o1 + o3
+    emit_fr_sub(out, "rb", "rd", "odb"); // o1 - o3
+    emit_fr_load(out, "global", "rw", "consts", 0); // w1
+    emit_fr_mul_call(out, "odb", "ra", "rw"); // od1 = (o1 + o3) * w1
+    emit_fr_load(out, "global", "rw", "consts", 64); // w3
+    emit_fr_mul_call(out, "odd", "rb", "rw"); // od3 = (o1 - o3) * w3
+
+    // Load gen_inv_t_scaled[t]
+    let _ = writeln!(
+        out,
+        "    mul.wide.u32 %off, %t, 32;\n    add.u64 %addr, %gen_t, %off;"
+    );
+    emit_fr_load(out, "global", "rgt", "addr", 0);
+
+    // Emit v0..v3 scaled by gt * sn[0..4] to t_out[s*n + t]
+    for (s, (ev, od)) in [
+        ("eva", "oda"),
+        ("evb", "odb"),
+        ("evc", "odc"),
+        ("evd", "odd"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let sn_off = (3 + s) * 32;
+        emit_fr_add(out, "rv", ev, od);
+        emit_fr_mul_call(out, "rv", "rv", "rgt");
+        emit_fr_load(out, "global", "rsn", "consts", sn_off);
+        emit_fr_mul_call(out, "rv", "rv", "rsn");
+        let _ = writeln!(
+            out,
+            "    mad.lo.u32 %idx, {s}, %n, %t;\n    mul.wide.u32 %off, %idx, 32;\n    add.u64 %addr, %t_out, %off;"
+        );
+        emit_fr_store(out, "global", "addr", 0, "rv");
+    }
+
+    // v4 = ev0 - od0 -> store scaled into t_out[4*n + t] if t < 16, else flag overflow if nonzero
+    emit_fr_sub(out, "rv", "eva", "oda");
+    let _ = writeln!(
+        out,
+        "    setp.lt.u32 %p_lt16, %t, 16;\n    @!%p_lt16 bra L_R8_V4_HI;"
+    );
+    emit_fr_mul_call(out, "rv", "rv", "rgt");
+    emit_fr_load(out, "global", "rsn", "consts", 7 * 32); // sn[4]
+    emit_fr_mul_call(out, "rv", "rv", "rsn");
+    let _ = writeln!(
+        out,
+        "    mad.lo.u32 %idx, 4, %n, %t;\n    mul.wide.u32 %off, %idx, 32;\n    add.u64 %addr, %t_out, %off;"
+    );
+    emit_fr_store(out, "global", "addr", 0, "rv");
+    let _ = writeln!(out, "    bra L_R8_V5;\nL_R8_V4_HI:");
+    emit_fr_is_zero(out, "pz", "rv");
+    let _ = writeln!(
+        out,
+        "    @%pz bra L_R8_V5;\n    atom.global.or.b32 %dummy, [%flags], 2;"
+    );
+
+    // v5 = ev1 - od1, v6 = ev2 - od2 -> flag overflow (bit 1) if nonzero
+    let _ = writeln!(out, "L_R8_V5:");
+    emit_fr_sub(out, "rv", "evb", "odb");
+    emit_fr_is_zero(out, "pz", "rv");
+    let _ = writeln!(
+        out,
+        "    @%pz bra L_R8_V6;\n    atom.global.or.b32 %dummy, [%flags], 2;"
+    );
+    let _ = writeln!(out, "L_R8_V6:");
+    emit_fr_sub(out, "rv", "evc", "odc");
+    emit_fr_is_zero(out, "pz", "rv");
+    let _ = writeln!(
+        out,
+        "    @%pz bra L_R8_V7;\n    atom.global.or.b32 %dummy, [%flags], 2;"
+    );
+
+    // v7 = ev3 - od3 -> flag unsatisfied (bit 0) if nonzero
+    let _ = writeln!(out, "L_R8_V7:");
+    emit_fr_sub(out, "rv", "evd", "odd");
+    emit_fr_is_zero(out, "pz", "rv");
+    let _ = writeln!(
+        out,
+        "    @%pz ret;\n    atom.global.or.b32 %dummy, [%flags], 1;\n    ret;\n}}"
+    );
 }
 
 /// Generate the complete PTX source module for BLS12-381 GPU MSM & NTT kernels.

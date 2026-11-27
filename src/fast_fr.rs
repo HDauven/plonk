@@ -1007,7 +1007,8 @@ unsafe fn poly_evaluate_adx(
     sum.to_bls()
 }
 
-/// Fast Ruffini synthetic division of `coeffs` by `(X - z)` using ADX/BMI2.
+/// Fast Ruffini synthetic division of `coeffs` by `(X - z)` using ADX/BMI2
+/// and 2-pass parallel block carry propagation for large polynomials.
 pub(crate) fn poly_ruffini_fast(
     coeffs: &[BlsScalar],
     z: &BlsScalar,
@@ -1016,6 +1017,69 @@ pub(crate) fn poly_ruffini_fast(
     if quotient_len == 0 {
         return Vec::new();
     }
+
+    const PARALLEL_RUFFINI_MIN_LEN: usize = 1 << 12;
+    const RUFFINI_BLOCK: usize = 2048;
+
+    #[cfg(feature = "std")]
+    if quotient_len >= PARALLEL_RUFFINI_MIN_LEN
+        && rayon::current_num_threads() > 1
+    {
+        use rayon::prelude::*;
+
+        let fz = FastFr::from_bls(z);
+        let num_blocks = quotient_len.div_ceil(RUFFINI_BLOCK);
+        let mut local_q = vec![FastFr::ZERO; quotient_len];
+
+        // Pass 1: independent local Ruffini per block starting from carry 0.
+        let block_exits: Vec<(FastFr, usize)> = local_q
+            .par_chunks_mut(RUFFINI_BLOCK)
+            .enumerate()
+            .map(|(b, out_blk)| {
+                let start = b * RUFFINI_BLOCK;
+                let len = out_blk.len();
+                let exit = poly_ruffini_local_fast(
+                    &coeffs[start + 1..start + 1 + len],
+                    fz,
+                    out_blk,
+                );
+                (exit, len)
+            })
+            .collect();
+
+        // Serial carry propagation across the ~32 blocks (< 1 µs).
+        let z_pow_block =
+            FastFr::from_bls(&z.pow_vartime(&[RUFFINI_BLOCK as u64, 0, 0, 0]));
+        let mut incoming = vec![FastFr::ZERO; num_blocks];
+        for b in (0..num_blocks - 1).rev() {
+            let (exit_above, len_above) = block_exits[b + 1];
+            let z_pow_above = if len_above == RUFFINI_BLOCK {
+                z_pow_block
+            } else {
+                FastFr::from_bls(&z.pow_vartime(&[len_above as u64, 0, 0, 0]))
+            };
+            let carry_above = incoming[b + 1];
+            let shifted = mul_fast(carry_above, z_pow_above);
+            incoming[b] = add_fast(exit_above, shifted);
+        }
+
+        // Pass 2: add `incoming[b] * z^(end - i)` and convert `FastFr -> BlsScalar`.
+        let mut quotient = vec![BlsScalar::zero(); quotient_len];
+        quotient
+            .par_chunks_mut(RUFFINI_BLOCK)
+            .zip(local_q.par_chunks(RUFFINI_BLOCK))
+            .enumerate()
+            .for_each(|(b, (dst_blk, src_blk))| {
+                poly_ruffini_apply_carry_fast(
+                    src_blk,
+                    incoming[b],
+                    fz,
+                    dst_blk,
+                );
+            });
+        return quotient;
+    }
+
     #[cfg(target_arch = "x86_64")]
     if has_adx_bmi2() {
         // SAFETY: runtime checked ADX + BMI2.
@@ -1029,6 +1093,550 @@ pub(crate) fn poly_ruffini_fast(
         quotient[i] = value;
     }
     quotient
+}
+
+#[inline]
+fn mul_fast(a: FastFr, b: FastFr) -> FastFr {
+    #[cfg(target_arch = "x86_64")]
+    if has_adx_bmi2() {
+        // SAFETY: runtime checked ADX + BMI2.
+        return unsafe { mul_adx_inner(a, b) };
+    }
+    mul_portable(a, b)
+}
+
+#[inline]
+fn add_fast(a: FastFr, b: FastFr) -> FastFr {
+    #[cfg(target_arch = "x86_64")]
+    if has_adx_bmi2() {
+        // SAFETY: runtime checked ADX + BMI2.
+        return unsafe { add_adx_inner(a, b) };
+    }
+    a.add_portable(b)
+}
+
+#[cfg(feature = "std")]
+fn poly_ruffini_local_fast(
+    src_plus_one: &[BlsScalar],
+    fz: FastFr,
+    out_blk: &mut [FastFr],
+) -> FastFr {
+    #[cfg(target_arch = "x86_64")]
+    if has_adx_bmi2() {
+        // SAFETY: runtime checked ADX + BMI2.
+        return unsafe { poly_ruffini_local_adx(src_plus_one, fz, out_blk) };
+    }
+    let len = out_blk.len();
+    let mut value = FastFr::ZERO;
+    for i in (0..len).rev() {
+        let c = FastFr::from_bls(&src_plus_one[i]);
+        value = mul_portable(value, fz).add_portable(c);
+        out_blk[i] = value;
+    }
+    value
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[target_feature(enable = "adx,bmi2")]
+unsafe fn poly_ruffini_local_adx(
+    src_plus_one: &[BlsScalar],
+    fz: FastFr,
+    out_blk: &mut [FastFr],
+) -> FastFr {
+    let len = out_blk.len();
+    let mut value = FastFr::ZERO;
+    for i in (0..len).rev() {
+        let c = FastFr::from_bls(&src_plus_one[i]);
+        value = unsafe { add_adx_ref(mul_adx_ref(&value, &fz), &c) };
+        out_blk[i] = value;
+    }
+    value
+}
+
+#[cfg(feature = "std")]
+fn poly_ruffini_apply_carry_fast(
+    src_blk: &[FastFr],
+    incoming: FastFr,
+    fz: FastFr,
+    dst_blk: &mut [BlsScalar],
+) {
+    if incoming.is_zero() {
+        for (d, s) in dst_blk.iter_mut().zip(src_blk.iter()) {
+            *d = s.to_bls();
+        }
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if has_adx_bmi2() {
+        // SAFETY: runtime checked ADX + BMI2.
+        unsafe {
+            poly_ruffini_apply_carry_adx(src_blk, incoming, fz, dst_blk);
+        }
+        return;
+    }
+    let len = src_blk.len();
+    let mut carry = incoming;
+    for i in (0..len).rev() {
+        carry = mul_portable(carry, fz);
+        dst_blk[i] = src_blk[i].add_portable(carry).to_bls();
+    }
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[target_feature(enable = "adx,bmi2")]
+unsafe fn poly_ruffini_apply_carry_adx(
+    src_blk: &[FastFr],
+    incoming: FastFr,
+    fz: FastFr,
+    dst_blk: &mut [BlsScalar],
+) {
+    let len = src_blk.len();
+    let mut carry = incoming;
+    for i in (0..len).rev() {
+        carry = unsafe { mul_adx_ref(&carry, &fz) };
+        let v = unsafe { add_adx_ref(src_blk[i], &carry) };
+        dst_blk[i] = v.to_bls();
+    }
+}
+
+/// Compute one chunk of permutation ratios using `FastFr` (ADX/BMI2 when
+/// available), batch-invert denominators in-place, compute the chunk's local
+/// exclusive prefix product (`local[0] = 1`), and return the total product of
+/// the chunk.
+#[cfg(feature = "std")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn perm_chunk_prefix_fast(
+    wires: [&[BlsScalar]; 4],
+    sigmas: [&[BlsScalar]; 4],
+    start: usize,
+    init_root: FastFr,
+    group_gen: FastFr,
+    beta: FastFr,
+    beta_k1: FastFr,
+    beta_k2: FastFr,
+    beta_k3: FastFr,
+    gamma: FastFr,
+    out_chunk: &mut [FastFr],
+    denoms: &mut Vec<FastFr>,
+    prods: &mut Vec<FastFr>,
+) -> FastFr {
+    #[cfg(target_arch = "x86_64")]
+    if has_adx_bmi2() {
+        // SAFETY: runtime checked ADX + BMI2.
+        return unsafe {
+            perm_chunk_prefix_adx(
+                wires, sigmas, start, init_root, group_gen, beta, beta_k1,
+                beta_k2, beta_k3, gamma, out_chunk, denoms, prods,
+            )
+        };
+    }
+    perm_chunk_prefix_portable(
+        wires, sigmas, start, init_root, group_gen, beta, beta_k1, beta_k2,
+        beta_k3, gamma, out_chunk, denoms, prods,
+    )
+}
+
+#[cfg(feature = "std")]
+#[inline]
+fn invert_fast_fr_nonzero(v: FastFr) -> FastFr {
+    #[cfg(feature = "blst-backend")]
+    {
+        let mut blst_in = blst::blst_fr { l: v.0 };
+        let mut blst_out = blst::blst_fr::default();
+        // SAFETY: `v` is nonzero; `blst_fr` matches `FastFr` Montgomery limbs.
+        unsafe {
+            blst::blst_fr_eucl_inverse(&mut blst_out, &blst_in);
+        }
+        let _ = &mut blst_in;
+        FastFr(blst_out.l)
+    }
+    #[cfg(not(feature = "blst-backend"))]
+    {
+        FastFr::from_bls(&v.to_bls().invert().expect("nonzero"))
+    }
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[target_feature(enable = "adx,bmi2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn perm_chunk_prefix_adx(
+    wires: [&[BlsScalar]; 4],
+    sigmas: [&[BlsScalar]; 4],
+    start: usize,
+    mut root: FastFr,
+    group_gen: FastFr,
+    beta: FastFr,
+    beta_k1: FastFr,
+    beta_k2: FastFr,
+    beta_k3: FastFr,
+    gamma: FastFr,
+    out_chunk: &mut [FastFr],
+    denoms: &mut Vec<FastFr>,
+    prods: &mut Vec<FastFr>,
+) -> FastFr {
+    let len = out_chunk.len();
+    denoms.clear();
+    prods.clear();
+    let mut acc_prod = FastFr::ONE;
+
+    for (offset, slot) in out_chunk.iter_mut().enumerate() {
+        let i = start + offset;
+        let a_g =
+            unsafe { add_adx_ref(FastFr::from_bls(&wires[0][i]), &gamma) };
+        let b_g =
+            unsafe { add_adx_ref(FastFr::from_bls(&wires[1][i]), &gamma) };
+        let c_g =
+            unsafe { add_adx_ref(FastFr::from_bls(&wires[2][i]), &gamma) };
+        let d_g =
+            unsafe { add_adx_ref(FastFr::from_bls(&wires[3][i]), &gamma) };
+
+        let n0 = unsafe { add_adx_ref(a_g, &mul_adx_ref(&beta, &root)) };
+        let n1 = unsafe { add_adx_ref(b_g, &mul_adx_ref(&beta_k1, &root)) };
+        let n2 = unsafe { add_adx_ref(c_g, &mul_adx_ref(&beta_k2, &root)) };
+        let n3 = unsafe { add_adx_ref(d_g, &mul_adx_ref(&beta_k3, &root)) };
+        let n01 = unsafe { mul_adx_ref(&n0, &n1) };
+        let n23 = unsafe { mul_adx_ref(&n2, &n3) };
+        *slot = unsafe { mul_adx_ref(&n01, &n23) };
+
+        let s0 = FastFr::from_bls(&sigmas[0][i]);
+        let s1 = FastFr::from_bls(&sigmas[1][i]);
+        let s2 = FastFr::from_bls(&sigmas[2][i]);
+        let s3 = FastFr::from_bls(&sigmas[3][i]);
+        let d0 = unsafe { add_adx_ref(a_g, &mul_adx_ref(&beta, &s0)) };
+        let d1 = unsafe { add_adx_ref(b_g, &mul_adx_ref(&beta, &s1)) };
+        let d2 = unsafe { add_adx_ref(c_g, &mul_adx_ref(&beta, &s2)) };
+        let d3 = unsafe { add_adx_ref(d_g, &mul_adx_ref(&beta, &s3)) };
+        let d01 = unsafe { mul_adx_ref(&d0, &d1) };
+        let d23 = unsafe { mul_adx_ref(&d2, &d3) };
+        let den = unsafe { mul_adx_ref(&d01, &d23) };
+        assert!(!den.is_zero(), "permutation denominator must be nonzero");
+        denoms.push(den);
+        prods.push(acc_prod);
+        acc_prod = unsafe { mul_adx_ref(&acc_prod, &den) };
+        root = unsafe { mul_adx_ref(&root, &group_gen) };
+    }
+
+    let mut inv_acc = invert_fast_fr_nonzero(acc_prod);
+    for k in (0..len).rev() {
+        let den = denoms[k];
+        let den_inv = unsafe { mul_adx_ref(&inv_acc, &prods[k]) };
+        inv_acc = unsafe { mul_adx_ref(&inv_acc, &den) };
+        out_chunk[k] = unsafe { mul_adx_ref(&out_chunk[k], &den_inv) };
+    }
+
+    let mut prefix = FastFr::ONE;
+    for slot in out_chunk.iter_mut() {
+        let r = *slot;
+        *slot = prefix;
+        prefix = unsafe { mul_adx_ref(&prefix, &r) };
+    }
+    prefix
+}
+
+#[cfg(feature = "std")]
+#[allow(clippy::too_many_arguments)]
+fn perm_chunk_prefix_portable(
+    wires: [&[BlsScalar]; 4],
+    sigmas: [&[BlsScalar]; 4],
+    start: usize,
+    mut root: FastFr,
+    group_gen: FastFr,
+    beta: FastFr,
+    beta_k1: FastFr,
+    beta_k2: FastFr,
+    beta_k3: FastFr,
+    gamma: FastFr,
+    out_chunk: &mut [FastFr],
+    denoms: &mut Vec<FastFr>,
+    prods: &mut Vec<FastFr>,
+) -> FastFr {
+    let len = out_chunk.len();
+    denoms.clear();
+    prods.clear();
+    let mut acc_prod = FastFr::ONE;
+
+    for (offset, slot) in out_chunk.iter_mut().enumerate() {
+        let i = start + offset;
+        let a_g = FastFr::from_bls(&wires[0][i]).add_portable(gamma);
+        let b_g = FastFr::from_bls(&wires[1][i]).add_portable(gamma);
+        let c_g = FastFr::from_bls(&wires[2][i]).add_portable(gamma);
+        let d_g = FastFr::from_bls(&wires[3][i]).add_portable(gamma);
+
+        let n0 = a_g.add_portable(mul_portable(beta, root));
+        let n1 = b_g.add_portable(mul_portable(beta_k1, root));
+        let n2 = c_g.add_portable(mul_portable(beta_k2, root));
+        let n3 = d_g.add_portable(mul_portable(beta_k3, root));
+        *slot = mul_portable(mul_portable(n0, n1), mul_portable(n2, n3));
+
+        let d0 = a_g
+            .add_portable(mul_portable(beta, FastFr::from_bls(&sigmas[0][i])));
+        let d1 = b_g
+            .add_portable(mul_portable(beta, FastFr::from_bls(&sigmas[1][i])));
+        let d2 = c_g
+            .add_portable(mul_portable(beta, FastFr::from_bls(&sigmas[2][i])));
+        let d3 = d_g
+            .add_portable(mul_portable(beta, FastFr::from_bls(&sigmas[3][i])));
+        let den = mul_portable(mul_portable(d0, d1), mul_portable(d2, d3));
+        assert!(!den.is_zero(), "permutation denominator must be nonzero");
+        denoms.push(den);
+        prods.push(acc_prod);
+        acc_prod = mul_portable(acc_prod, den);
+        root = mul_portable(root, group_gen);
+    }
+
+    let mut inv_acc = invert_fast_fr_nonzero(acc_prod);
+    for k in (0..len).rev() {
+        let den = denoms[k];
+        let den_inv = mul_portable(inv_acc, prods[k]);
+        inv_acc = mul_portable(inv_acc, den);
+        out_chunk[k] = mul_portable(out_chunk[k], den_inv);
+    }
+
+    let mut prefix = FastFr::ONE;
+    for slot in out_chunk.iter_mut() {
+        let r = *slot;
+        *slot = prefix;
+        prefix = mul_portable(prefix, r);
+    }
+    prefix
+}
+
+/// Multiply each `FastFr` in `src` by `scale` (skipping the mul when
+/// `scale == ONE`) and write canonical `BlsScalar` outputs into `dst`.
+#[cfg(feature = "std")]
+pub(crate) fn scale_fast_fr_to_bls_chunk(
+    src: &[FastFr],
+    scale: FastFr,
+    dst: &mut [BlsScalar],
+) {
+    if scale == FastFr::ONE {
+        for (d, s) in dst.iter_mut().zip(src.iter()) {
+            *d = s.to_bls();
+        }
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if has_adx_bmi2() {
+        // SAFETY: runtime checked ADX + BMI2.
+        unsafe { scale_fast_fr_to_bls_adx(src, scale, dst) };
+        return;
+    }
+    for (d, s) in dst.iter_mut().zip(src.iter()) {
+        *d = mul_portable(*s, scale).to_bls();
+    }
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[target_feature(enable = "adx,bmi2")]
+unsafe fn scale_fast_fr_to_bls_adx(
+    src: &[FastFr],
+    scale: FastFr,
+    dst: &mut [BlsScalar],
+) {
+    for (d, s) in dst.iter_mut().zip(src.iter()) {
+        *d = unsafe { mul_adx_ref(s, &scale) }.to_bls();
+    }
+}
+
+/// Fused linear combination + 2-pass parallel block Ruffini division producing
+/// `Vec<FastFr>` directly (zero intermediate `FastFr -> BlsScalar` Montgomery
+/// round-trips when feeding the result straight into GPU MSM).
+#[cfg(feature = "gpu-cuda")]
+pub(crate) fn poly_lincomb_and_ruffini_fast_fr(
+    terms: &[(BlsScalar, &[BlsScalar])],
+    z: &BlsScalar,
+) -> Vec<FastFr> {
+    use rayon::prelude::*;
+
+    let max_len = terms
+        .iter()
+        .filter(|(s, p)| *s != BlsScalar::zero() && !p.is_empty())
+        .map(|(_, p)| p.len())
+        .max()
+        .unwrap_or(0);
+    let quotient_len = max_len.saturating_sub(1);
+    if quotient_len == 0 {
+        return Vec::new();
+    }
+
+    // 1. Compute coefficients[1..max_len] directly into `Vec<FastFr>` (index 0
+    // is discarded by Ruffini division by `X - z`).
+    let mut coeffs = vec![FastFr::ZERO; quotient_len];
+    const CHUNK: usize = 512;
+    let fast_terms: Vec<(FastFr, &[BlsScalar])> = terms
+        .iter()
+        .filter_map(|&(s, p)| {
+            let fs = FastFr::from_bls(&s);
+            (!fs.is_zero() && p.len() > 1).then_some((fs, &p[1..]))
+        })
+        .collect();
+    if quotient_len >= (1 << 12) && rayon::current_num_threads() > 1 {
+        coeffs.par_chunks_mut(CHUNK).enumerate().for_each(
+            |(chunk_idx, out_chunk)| {
+                poly_lincomb_chunk_fast_fr(
+                    &fast_terms,
+                    chunk_idx * CHUNK,
+                    out_chunk,
+                );
+            },
+        );
+    } else {
+        poly_lincomb_chunk_fast_fr(&fast_terms, 0, &mut coeffs);
+    }
+
+    // 2. Parallel block Ruffini in-place on `Vec<FastFr>` (zero `to_bls`!).
+    let fz = FastFr::from_bls(z);
+    const RUFFINI_BLOCK: usize = 2048;
+    if quotient_len >= (1 << 12) && rayon::current_num_threads() > 1 {
+        let num_blocks = quotient_len.div_ceil(RUFFINI_BLOCK);
+        let block_exits: Vec<(FastFr, usize)> = coeffs
+            .par_chunks_mut(RUFFINI_BLOCK)
+            .map(|blk| (poly_ruffini_inplace_local_fast_fr(blk, fz), blk.len()))
+            .collect();
+
+        let z_pow_block =
+            FastFr::from_bls(&z.pow_vartime(&[RUFFINI_BLOCK as u64, 0, 0, 0]));
+        let mut incoming = vec![FastFr::ZERO; num_blocks];
+        for b in (0..num_blocks - 1).rev() {
+            let (exit_above, len_above) = block_exits[b + 1];
+            let z_pow_above = if len_above == RUFFINI_BLOCK {
+                z_pow_block
+            } else {
+                FastFr::from_bls(&z.pow_vartime(&[len_above as u64, 0, 0, 0]))
+            };
+            let shifted = mul_fast(incoming[b + 1], z_pow_above);
+            incoming[b] = add_fast(exit_above, shifted);
+        }
+
+        coeffs.par_chunks_mut(RUFFINI_BLOCK).enumerate().for_each(
+            |(b, blk)| {
+                let inc = incoming[b];
+                if !inc.is_zero() {
+                    poly_ruffini_apply_carry_inplace_fast_fr(blk, inc, fz);
+                }
+            },
+        );
+    } else {
+        poly_ruffini_inplace_local_fast_fr(&mut coeffs, fz);
+    }
+
+    coeffs
+}
+
+#[cfg(feature = "gpu-cuda")]
+fn poly_lincomb_chunk_fast_fr(
+    terms: &[(FastFr, &[BlsScalar])],
+    start: usize,
+    out_chunk: &mut [FastFr],
+) {
+    #[cfg(target_arch = "x86_64")]
+    if has_adx_bmi2() {
+        // SAFETY: runtime checked ADX + BMI2.
+        unsafe { poly_lincomb_chunk_fast_fr_adx(terms, start, out_chunk) };
+        return;
+    }
+    let len = out_chunk.len();
+    for &(fs, poly) in terms {
+        if start >= poly.len() {
+            continue;
+        }
+        let end = (start + len).min(poly.len());
+        for (dst, src) in
+            out_chunk[..end - start].iter_mut().zip(&poly[start..end])
+        {
+            *dst = dst.add_portable(mul_portable(FastFr::from_bls(src), fs));
+        }
+    }
+}
+
+#[cfg(all(feature = "gpu-cuda", target_arch = "x86_64"))]
+#[target_feature(enable = "adx,bmi2")]
+unsafe fn poly_lincomb_chunk_fast_fr_adx(
+    terms: &[(FastFr, &[BlsScalar])],
+    start: usize,
+    out_chunk: &mut [FastFr],
+) {
+    let len = out_chunk.len();
+    for &(fs, poly) in terms {
+        if start >= poly.len() {
+            continue;
+        }
+        let end = (start + len).min(poly.len());
+        for (dst, src) in
+            out_chunk[..end - start].iter_mut().zip(&poly[start..end])
+        {
+            let fsrc = FastFr::from_bls(src);
+            let prod = unsafe { mul_adx_ref(&fsrc, &fs) };
+            *dst = unsafe { add_adx_ref(*dst, &prod) };
+        }
+    }
+}
+
+#[cfg(feature = "gpu-cuda")]
+fn poly_ruffini_inplace_local_fast_fr(
+    blk: &mut [FastFr],
+    fz: FastFr,
+) -> FastFr {
+    #[cfg(target_arch = "x86_64")]
+    if has_adx_bmi2() {
+        // SAFETY: runtime checked ADX + BMI2.
+        return unsafe { poly_ruffini_inplace_local_fast_fr_adx(blk, fz) };
+    }
+    let mut value = FastFr::ZERO;
+    for slot in blk.iter_mut().rev() {
+        value = mul_portable(value, fz).add_portable(*slot);
+        *slot = value;
+    }
+    value
+}
+
+#[cfg(all(feature = "gpu-cuda", target_arch = "x86_64"))]
+#[target_feature(enable = "adx,bmi2")]
+unsafe fn poly_ruffini_inplace_local_fast_fr_adx(
+    blk: &mut [FastFr],
+    fz: FastFr,
+) -> FastFr {
+    let mut value = FastFr::ZERO;
+    for slot in blk.iter_mut().rev() {
+        value = unsafe { add_adx_ref(mul_adx_ref(&value, &fz), slot) };
+        *slot = value;
+    }
+    value
+}
+
+#[cfg(feature = "gpu-cuda")]
+fn poly_ruffini_apply_carry_inplace_fast_fr(
+    blk: &mut [FastFr],
+    incoming: FastFr,
+    fz: FastFr,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if has_adx_bmi2() {
+        // SAFETY: runtime checked ADX + BMI2.
+        unsafe {
+            poly_ruffini_apply_carry_inplace_fast_fr_adx(blk, incoming, fz);
+        }
+        return;
+    }
+    let mut carry = incoming;
+    for slot in blk.iter_mut().rev() {
+        carry = mul_portable(carry, fz);
+        *slot = slot.add_portable(carry);
+    }
+}
+
+#[cfg(all(feature = "gpu-cuda", target_arch = "x86_64"))]
+#[target_feature(enable = "adx,bmi2")]
+unsafe fn poly_ruffini_apply_carry_inplace_fast_fr_adx(
+    blk: &mut [FastFr],
+    incoming: FastFr,
+    fz: FastFr,
+) {
+    let mut carry = incoming;
+    for slot in blk.iter_mut().rev() {
+        carry = unsafe { mul_adx_ref(&carry, &fz) };
+        *slot = unsafe { add_adx_ref(*slot, &carry) };
+    }
 }
 
 #[cfg(target_arch = "x86_64")]

@@ -397,34 +397,29 @@ impl CommitKey {
             .map_err(|_| Error::PolynomialDegreeTooLarge)
     }
 
-    /// Computes a single witness for multiple polynomials at the same point, by
-    /// taking a random linear combination of the individual witnesses.
-    /// We apply the same optimization mentioned in when computing each witness;
-    /// removing f(z).
-    pub(crate) fn compute_aggregate_witness(
-        polynomials: &[&Polynomial],
+    /// Computes a single witness for weighted polynomial terms `(scalar, poly)`
+    /// at `point` by evaluating their linear combination and dividing by
+    /// `X - point` via Ruffini's method.
+    pub(crate) fn compute_weighted_witness(
+        terms: &[(BlsScalar, &Polynomial)],
         point: &BlsScalar,
-        v_challenge: &BlsScalar,
     ) -> Polynomial {
-        if polynomials.is_empty() {
+        let max_len = terms
+            .iter()
+            .filter(|(s, p)| *s != BlsScalar::zero() && !p.is_zero())
+            .map(|(_, p)| p.len())
+            .max()
+            .unwrap_or(0);
+        if max_len <= 1 {
             return Polynomial::zero();
         }
 
-        let max_len = polynomials.iter().map(|poly| poly.len()).max().unwrap();
-        if max_len == 0 {
-            return Polynomial::zero();
-        }
-
-        let powers = util::powers_of(v_challenge, polynomials.len() - 1);
         let mut coefficients = vec![BlsScalar::zero(); max_len];
 
         #[cfg(feature = "std")]
         {
-            let raw_terms: Vec<(BlsScalar, &[BlsScalar])> = powers
-                .iter()
-                .zip(polynomials.iter())
-                .map(|(&p, poly)| (p, &poly[..]))
-                .collect();
+            let raw_terms: Vec<(BlsScalar, &[BlsScalar])> =
+                terms.iter().map(|&(s, p)| (s, &p[..])).collect();
             const PARALLEL_AGG_MIN_LEN: usize = 1 << 12;
             const AGG_CHUNK_SIZE: usize = 512;
             if max_len >= PARALLEL_AGG_MIN_LEN
@@ -454,16 +449,39 @@ impl CommitKey {
 
         #[cfg(not(feature = "std"))]
         {
-            for (polynomial, power) in polynomials.iter().zip(&powers) {
+            for &(scalar, polynomial) in terms {
+                if scalar == BlsScalar::zero() {
+                    continue;
+                }
                 for (coefficient, term) in
                     coefficients.iter_mut().zip(polynomial.iter())
                 {
-                    *coefficient += *term * power;
+                    *coefficient += *term * scalar;
                 }
             }
 
             Polynomial::from_coefficients_vec(coefficients).ruffini(*point)
         }
+    }
+
+    /// Computes a single witness for multiple polynomials at the same point, by
+    /// taking a random linear combination of the individual witnesses.
+    /// We apply the same optimization mentioned in when computing each witness;
+    /// removing f(z).
+    pub(crate) fn compute_aggregate_witness(
+        polynomials: &[&Polynomial],
+        point: &BlsScalar,
+        v_challenge: &BlsScalar,
+    ) -> Polynomial {
+        if polynomials.is_empty() {
+            return Polynomial::zero();
+        }
+        let powers = util::powers_of(v_challenge, polynomials.len() - 1);
+        let terms: Vec<(BlsScalar, &Polynomial)> = powers
+            .into_iter()
+            .zip(polynomials.iter().copied())
+            .collect();
+        Self::compute_weighted_witness(&terms, point)
     }
 }
 

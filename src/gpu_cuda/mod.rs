@@ -31,6 +31,11 @@ use crate::blst_backend::blst_p1s_to_g1_affines;
 use crate::fast_fr::FastFr;
 use driver::{CuFunction, CudaBuf, CudaDriver, CudaHostBuf};
 
+pub(crate) type SplitQuotientWithComms = ([Vec<BlsScalar>; 4], [G1Affine; 4]);
+
+type MsmInnerResult<const K: usize, R> =
+    Result<Option<([G1Affine; K], R)>, (&'static str, i32)>;
+
 /// Minimum polynomial length to offload an MSM to GPU.
 pub(crate) const GPU_MSM_MIN_LEN: usize = 4096;
 
@@ -72,6 +77,9 @@ struct GpuMsmScratch {
     scalars_mont: CudaBuf,
     scalars_std: CudaBuf,
     counts: CudaBuf,
+    block_totals: CudaBuf,
+    block_offsets: CudaBuf,
+    totals_out: CudaBuf,
     cursors: CudaBuf,
     sorted: CudaBuf,
     tasks: CudaBuf,
@@ -79,8 +87,8 @@ struct GpuMsmScratch {
     buckets: CudaBuf,
     window_sums: CudaBuf,
     host_packed: CudaHostBuf<[u64; 4]>,
-    host_counts: CudaHostBuf<u32>,
-    host_cursors: CudaHostBuf<u32>,
+    host_totals: CudaHostBuf<u32>,
+    host_wsums: CudaHostBuf<GpuXyzz>,
 }
 
 impl GpuMsmScratch {
@@ -89,6 +97,9 @@ impl GpuMsmScratch {
             scalars_mont: CudaBuf::alloc(drv, 16)?,
             scalars_std: CudaBuf::alloc(drv, 16)?,
             counts: CudaBuf::alloc(drv, 16)?,
+            block_totals: CudaBuf::alloc(drv, 16)?,
+            block_offsets: CudaBuf::alloc(drv, 16)?,
+            totals_out: CudaBuf::alloc(drv, 16)?,
             cursors: CudaBuf::alloc(drv, 16)?,
             sorted: CudaBuf::alloc(drv, 16)?,
             tasks: CudaBuf::alloc(drv, 16)?,
@@ -96,8 +107,8 @@ impl GpuMsmScratch {
             buckets: CudaBuf::alloc(drv, 16)?,
             window_sums: CudaBuf::alloc(drv, 16)?,
             host_packed: CudaHostBuf::new(drv),
-            host_counts: CudaHostBuf::new(drv),
-            host_cursors: CudaHostBuf::new(drv),
+            host_totals: CudaHostBuf::new(drv),
+            host_wsums: CudaHostBuf::new(drv),
         })
     }
 }
@@ -107,8 +118,10 @@ struct GpuNttScratch {
     out: CudaBuf,
     q_evals: CudaBuf,
     ch_buf: CudaBuf,
+    flags_d: CudaBuf,
     host_src: CudaHostBuf<FastFr>,
     host_out: CudaHostBuf<FastFr>,
+    host_flags: CudaHostBuf<u32>,
 }
 
 impl GpuNttScratch {
@@ -118,8 +131,10 @@ impl GpuNttScratch {
             out: CudaBuf::alloc(drv, 16)?,
             q_evals: CudaBuf::alloc(drv, 16)?,
             ch_buf: CudaBuf::alloc(drv, 44 * core::mem::size_of::<FastFr>())?,
+            flags_d: CudaBuf::alloc(drv, 4)?,
             host_src: CudaHostBuf::new(drv),
             host_out: CudaHostBuf::new(drv),
+            host_flags: CudaHostBuf::new(drv),
         })
     }
 }
@@ -127,6 +142,9 @@ impl GpuNttScratch {
 struct GpuRuntime {
     drv: &'static CudaDriver,
     fn_count: CuFunction,
+    fn_scan_blocks: CuFunction,
+    fn_scan_totals: CuFunction,
+    fn_build_tasks: CuFunction,
     fn_scatter: CuFunction,
     fn_accumulate: CuFunction,
     fn_merge: CuFunction,
@@ -135,6 +153,7 @@ struct GpuRuntime {
     fn_ntt_bitrev_stage8: CuFunction,
     fn_ntt_radix2: CuFunction,
     fn_quot_eval: CuFunction,
+    fn_quot_combine: CuFunction,
     #[cfg(test)]
     fn_test_fp: CuFunction,
     scratch: Mutex<GpuMsmScratch>,
@@ -164,6 +183,12 @@ fn gpu_runtime() -> Option<&'static GpuRuntime> {
             };
             let fn_count =
                 drv.get_function(module, "msm_count_buckets").ok()?;
+            let fn_scan_blocks =
+                drv.get_function(module, "msm_scan_blocks").ok()?;
+            let fn_scan_totals =
+                drv.get_function(module, "msm_scan_block_totals").ok()?;
+            let fn_build_tasks =
+                drv.get_function(module, "msm_build_tasks").ok()?;
             let fn_scatter =
                 drv.get_function(module, "msm_scatter_indices").ok()?;
             let fn_accumulate =
@@ -180,6 +205,8 @@ fn gpu_runtime() -> Option<&'static GpuRuntime> {
                 drv.get_function(module, "ntt_radix2_stage").ok()?;
             let fn_quot_eval =
                 drv.get_function(module, "quotient_eval_wave").ok()?;
+            let fn_quot_combine =
+                drv.get_function(module, "quotient_radix8_combine").ok()?;
             #[cfg(test)]
             let fn_test_fp = drv.get_function(module, "test_fp_ops").ok()?;
             let scratch = GpuMsmScratch::new(drv).ok()?;
@@ -187,6 +214,9 @@ fn gpu_runtime() -> Option<&'static GpuRuntime> {
             Some(GpuRuntime {
                 drv,
                 fn_count,
+                fn_scan_blocks,
+                fn_scan_totals,
+                fn_build_tasks,
                 fn_scatter,
                 fn_accumulate,
                 fn_merge,
@@ -195,6 +225,7 @@ fn gpu_runtime() -> Option<&'static GpuRuntime> {
                 fn_ntt_bitrev_stage8,
                 fn_ntt_radix2,
                 fn_quot_eval,
+                fn_quot_combine,
                 #[cfg(test)]
                 fn_test_fp,
                 scratch: Mutex::new(scratch),
@@ -321,25 +352,6 @@ impl GpuCommitBases {
         &self,
         polys: [&[BlsScalar]; K],
     ) -> Option<[G1Affine; K]> {
-        #[cfg(test)]
-        {
-            self.msm_batch_inner(polys).unwrap_or_else(|(step, rc)| {
-                eprintln!(
-                    "fast-plonk gpu-cuda msm_batch failed at {step}: rc={rc}"
-                );
-                None
-            })
-        }
-        #[cfg(not(test))]
-        {
-            self.msm_batch_inner(polys).unwrap_or_default()
-        }
-    }
-
-    fn msm_batch_inner<const K: usize>(
-        &self,
-        polys: [&[BlsScalar]; K],
-    ) -> Result<Option<[G1Affine; K]>, (&'static str, i32)> {
         let mut lengths = [0usize; K];
         for (i, poly) in polys.iter().enumerate() {
             let mut len = poly.len();
@@ -347,14 +359,130 @@ impl GpuCommitBases {
                 len -= 1;
             }
             if len > self.base_len {
-                return Ok(None);
+                return None;
             }
             lengths[i] = len;
         }
+        self.msm_batch_core(
+            lengths,
+            |active_indices, msm_len, packed| {
+                packed.par_chunks_exact_mut(msm_len).enumerate().for_each(
+                    |(slot, dst)| {
+                        let poly_idx = active_indices[slot];
+                        let src = &polys[poly_idx][..lengths[poly_idx]];
+                        for (d, s) in
+                            dst[..src.len()].iter_mut().zip(src.iter())
+                        {
+                            *d = *s.internal_repr();
+                        }
+                        for d in &mut dst[src.len()..] {
+                            *d = [0u64; 4];
+                        }
+                    },
+                );
+            },
+            || (),
+        )
+        .map(|(aff, ())| aff)
+    }
 
+    /// Evaluate a batch of `K` MSMs directly from `(base, tail)` `FastFr`
+    /// slices (zero `FastFr -> BlsScalar` conversion), invoking
+    /// `while_gpu_busy` concurrently on the CPU right after launching the
+    /// asynchronous GPU accumulate/merge/reduce pipeline.
+    pub(crate) fn msm_batch_fast_fr_with_overlap<const K: usize, F, R>(
+        &self,
+        polys: [(&[FastFr], &[FastFr]); K],
+        while_gpu_busy: F,
+    ) -> Option<([G1Affine; K], R)>
+    where
+        F: FnOnce() -> R,
+    {
+        let mut lengths = [0usize; K];
+        for (i, &(base, tail)) in polys.iter().enumerate() {
+            let mut len = base.len() + tail.len();
+            while len > base.len() && tail[len - base.len() - 1].is_zero() {
+                len -= 1;
+            }
+            while len > 0 && len <= base.len() && base[len - 1].is_zero() {
+                len -= 1;
+            }
+            if len > self.base_len {
+                return None;
+            }
+            lengths[i] = len;
+        }
+        self.msm_batch_core(
+            lengths,
+            |active_indices, msm_len, packed| {
+                packed.par_chunks_exact_mut(msm_len).enumerate().for_each(
+                    |(slot, dst)| {
+                        let poly_idx = active_indices[slot];
+                        let len = lengths[poly_idx];
+                        let (base, tail) = polys[poly_idx];
+                        let b_len = len.min(base.len());
+                        for (d, s) in
+                            dst[..b_len].iter_mut().zip(&base[..b_len])
+                        {
+                            *d = s.0;
+                        }
+                        let t_len = len.saturating_sub(base.len());
+                        for (d, s) in dst[b_len..b_len + t_len]
+                            .iter_mut()
+                            .zip(&tail[..t_len])
+                        {
+                            *d = s.0;
+                        }
+                        for d in &mut dst[len..] {
+                            *d = [0u64; 4];
+                        }
+                    },
+                );
+            },
+            while_gpu_busy,
+        )
+    }
+
+    fn msm_batch_core<const K: usize, P, F, R>(
+        &self,
+        lengths: [usize; K],
+        pack_scalars: P,
+        while_gpu_busy: F,
+    ) -> Option<([G1Affine; K], R)>
+    where
+        P: FnOnce(&[usize; K], usize, &mut [[u64; 4]]),
+        F: FnOnce() -> R,
+    {
+        #[cfg(test)]
+        {
+            self.msm_batch_inner(lengths, pack_scalars, while_gpu_busy)
+                .unwrap_or_else(|(step, rc)| {
+                    eprintln!(
+                        "fast-plonk gpu-cuda msm_batch failed at {step}: rc={rc}"
+                    );
+                    None
+                })
+        }
+        #[cfg(not(test))]
+        {
+            self.msm_batch_inner(lengths, pack_scalars, while_gpu_busy)
+                .unwrap_or_default()
+        }
+    }
+
+    fn msm_batch_inner<const K: usize, P, F, R>(
+        &self,
+        lengths: [usize; K],
+        pack_scalars: P,
+        while_gpu_busy: F,
+    ) -> MsmInnerResult<K, R>
+    where
+        P: FnOnce(&[usize; K], usize, &mut [[u64; 4]]),
+        F: FnOnce() -> R,
+    {
         let max_len = lengths.iter().copied().max().unwrap_or(0);
         if max_len == 0 {
-            return Ok(Some([G1Affine::identity(); K]));
+            return Ok(Some(([G1Affine::identity(); K], while_gpu_busy())));
         }
         if max_len < GPU_MSM_MIN_LEN {
             return Ok(None);
@@ -412,18 +540,7 @@ impl GpuCommitBases {
         // Pack active polynomials' raw Montgomery limbs `[u64; 4]` directly
         // into reusable pinned host memory (zero allocation / zero page faults).
         let packed = scratch.host_packed.ensure_len(total_scalars);
-        packed.par_chunks_exact_mut(msm_len).enumerate().for_each(
-            |(slot, dst)| {
-                let poly_idx = active_indices[slot];
-                let src = &polys[poly_idx][..lengths[poly_idx]];
-                for (d, s) in dst[..src.len()].iter_mut().zip(src.iter()) {
-                    *d = *s.internal_repr();
-                }
-                for d in &mut dst[src.len()..] {
-                    *d = [0u64; 4];
-                }
-            },
-        );
+        pack_scalars(&active_indices, msm_len, packed);
 
         // 1. Upload scalars via pinned DMA and zero counts.
         rt.drv
@@ -466,71 +583,88 @@ impl GpuCommitBases {
                 .map_err(|e| ("launch_count", e))?;
         }
 
-        // 3. Exclusive prefix sum over `counts` -> `cursors` + load-balanced
-        // sub-bucket tasks (`<= max_bucket_chunk` additions per thread).
-        let counts_ptr = scratch.counts.ptr;
-        let counts_h = scratch.host_counts.ensure_len(total_buckets);
-        rt.drv
-            .copy_dtoh(counts_h, counts_ptr)
-            .map_err(|e| ("dtoh_cnt", e))?;
+        // 3. On-GPU exclusive prefix sum over `counts` -> `cursors`, `tasks`,
+        // `merges`, and zeroing of empty buckets (eliminates 1.3 MB DtoH,
+        // 5.2 MB HtoD, serial CPU scan, and 63 MB full bucket memset).
+        let num_blocks = total_buckets.div_ceil(256);
+        scratch
+            .block_totals
+            .ensure_capacity(num_blocks * 16)
+            .map_err(|e| ("alloc_btot", e))?;
+        scratch
+            .block_offsets
+            .ensure_capacity(num_blocks * 16)
+            .map_err(|e| ("alloc_boff", e))?;
         // Adaptive split threshold: ~2x the average bucket occupancy (min 32)
         // so normal Poisson buckets stay single-task with zero merge overhead,
         // while narrow top-window or skewed buckets split across parallel threads.
-        let max_bucket_chunk = ((msm_len / num_buckets) * 2).max(32) as u32;
-        let cursors_h = scratch.host_cursors.ensure_len(total_buckets);
-        let mut tasks_h = Vec::with_capacity(total_buckets);
-        let mut merges_h = Vec::new();
-        let mut running = 0u32;
-        let mut next_tmp = total_buckets as u32;
-        for (b, &c) in counts_h.iter().enumerate() {
-            let start = running;
-            cursors_h[b] = start;
-            running += c;
-            if c == 0 {
-                continue;
-            }
-            if c <= max_bucket_chunk {
-                tasks_h.push(GpuAccTask {
-                    start,
-                    end: running,
-                    dst: b as u32,
-                });
-            } else {
-                let tmp_start = next_tmp;
-                let mut cur = start;
-                while cur < running {
-                    let end = (cur + max_bucket_chunk).min(running);
-                    tasks_h.push(GpuAccTask {
-                        start: cur,
-                        end,
-                        dst: next_tmp,
-                    });
-                    next_tmp += 1;
-                    cur = end;
-                }
-                merges_h.push(GpuSplitMerge {
-                    dst_bucket: b as u32,
-                    tmp_start,
-                    tmp_count: next_tmp - tmp_start,
-                });
-            }
-        }
-        let total_entries = running as usize;
-        if total_entries == 0 {
-            return Ok(Some([G1Affine::identity(); K]));
-        }
-        let total_bucket_slots = next_tmp as usize;
+        let mut p_max_chunk = ((msm_len / num_buckets) * 2).max(32) as u32;
+        let mut p_total_b = total_buckets as u32;
+        let mut p_num_blks = num_blocks as u32;
+        let mut p_btot = scratch.block_totals.ptr;
+        let mut p_boff = scratch.block_offsets.ptr;
+        let mut p_tout = scratch.totals_out.ptr;
 
+        let mut params_sb: [*mut c_void; 4] = [
+            (&mut p_cnt as *mut u64).cast(),
+            (&mut p_btot as *mut u64).cast(),
+            (&mut p_total_b as *mut u32).cast(),
+            (&mut p_max_chunk as *mut u32).cast(),
+        ];
+        // SAFETY: parameter array matches `msm_scan_blocks` signature.
+        unsafe {
+            rt.drv
+                .launch(
+                    rt.fn_scan_blocks,
+                    (p_num_blks, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    &mut params_sb,
+                )
+                .map_err(|e| ("launch_scan_blocks", e))?;
+        }
+
+        let mut params_st: [*mut c_void; 5] = [
+            (&mut p_btot as *mut u64).cast(),
+            (&mut p_boff as *mut u64).cast(),
+            (&mut p_tout as *mut u64).cast(),
+            (&mut p_num_blks as *mut u32).cast(),
+            (&mut p_total_b as *mut u32).cast(),
+        ];
+        // SAFETY: parameter array matches `msm_scan_block_totals` signature.
+        unsafe {
+            rt.drv
+                .launch(
+                    rt.fn_scan_totals,
+                    (1, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    &mut params_st,
+                )
+                .map_err(|e| ("launch_scan_totals", e))?;
+        }
+
+        // Download ONLY 16 bytes (`[total_entries, num_tasks, num_merges, total_bucket_slots]`).
+        let totals_h = scratch.host_totals.ensure_len(4);
         rt.drv
-            .copy_htod(scratch.cursors.ptr, cursors_h)
-            .map_err(|e| ("htod_cur", e))?;
+            .copy_dtoh(totals_h, p_tout)
+            .map_err(|e| ("dtoh_totals", e))?;
+        let total_entries = totals_h[0] as usize;
+        let num_tasks = totals_h[1] as usize;
+        let num_merges = totals_h[2] as usize;
+        let total_bucket_slots = totals_h[3] as usize;
+        if total_entries == 0 || num_tasks == 0 {
+            drop(scratch_guard);
+            return Ok(Some(([G1Affine::identity(); K], while_gpu_busy())));
+        }
+
         scratch
             .sorted
             .ensure_capacity(total_entries * 4)
             .map_err(|e| ("alloc_srt", e))?;
         scratch
             .tasks
-            .ensure_capacity(tasks_h.len() * core::mem::size_of::<GpuAccTask>())
+            .ensure_capacity(num_tasks * core::mem::size_of::<GpuAccTask>())
             .map_err(|e| ("alloc_tsk", e))?;
         scratch
             .buckets
@@ -538,29 +672,43 @@ impl GpuCommitBases {
                 total_bucket_slots * core::mem::size_of::<GpuXyzz>(),
             )
             .map_err(|e| ("alloc_bkt", e))?;
-        if !merges_h.is_empty() {
+        if num_merges > 0 {
             scratch
                 .merges
                 .ensure_capacity(
-                    merges_h.len() * core::mem::size_of::<GpuSplitMerge>(),
+                    num_merges * core::mem::size_of::<GpuSplitMerge>(),
                 )
                 .map_err(|e| ("alloc_mrg", e))?;
-            rt.drv
-                .copy_htod(scratch.merges.ptr, &merges_h)
-                .map_err(|e| ("htod_mrg", e))?;
         }
-        rt.drv
-            .copy_htod(scratch.tasks.ptr, &tasks_h)
-            .map_err(|e| ("htod_tsk", e))?;
-        rt.drv
-            .memset_zero(
-                scratch.buckets.ptr,
-                total_buckets * core::mem::size_of::<GpuXyzz>(),
-            )
-            .map_err(|e| ("zero_bkt", e))?;
+
+        let mut p_cur = scratch.cursors.ptr;
+        let mut p_tsk = scratch.tasks.ptr;
+        let mut p_mrg = scratch.merges.ptr;
+        let mut p_bkt = scratch.buckets.ptr;
+        let mut params_bt: [*mut c_void; 8] = [
+            (&mut p_cnt as *mut u64).cast(),
+            (&mut p_boff as *mut u64).cast(),
+            (&mut p_cur as *mut u64).cast(),
+            (&mut p_tsk as *mut u64).cast(),
+            (&mut p_mrg as *mut u64).cast(),
+            (&mut p_bkt as *mut u64).cast(),
+            (&mut p_total_b as *mut u32).cast(),
+            (&mut p_max_chunk as *mut u32).cast(),
+        ];
+        // SAFETY: parameter array matches `msm_build_tasks` signature.
+        unsafe {
+            rt.drv
+                .launch(
+                    rt.fn_build_tasks,
+                    (p_num_blks, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    &mut params_bt,
+                )
+                .map_err(|e| ("launch_build_tasks", e))?;
+        }
 
         // 4. Scatter `(point_idx | (neg << 31))` into bucket-sorted array.
-        let mut p_cur = scratch.cursors.ptr;
         let mut p_srt = scratch.sorted.ptr;
         let mut params_sct: [*mut c_void; 8] = [
             (&mut p_ss as *mut u64).cast(),
@@ -586,9 +734,7 @@ impl GpuCommitBases {
         }
         // 5. Accumulate all load-balanced bucket tasks in parallel.
         let mut p_bases = self.bases_d.ptr;
-        let mut p_tsk = scratch.tasks.ptr;
-        let mut p_bkt = scratch.buckets.ptr;
-        let mut p_num_t = tasks_h.len() as u32;
+        let mut p_num_t = num_tasks as u32;
         let mut params_acc: [*mut c_void; 5] = [
             (&mut p_bases as *mut u64).cast(),
             (&mut p_tsk as *mut u64).cast(),
@@ -609,8 +755,7 @@ impl GpuCommitBases {
                 )
                 .map_err(|e| ("launch_accumulate", e))?;
         }
-        if !merges_h.is_empty() {
-            let mut p_mrg = scratch.merges.ptr;
+        if num_merges > 0 {
             let mut params_mrg: [*mut c_void; 2] = [
                 (&mut p_bkt as *mut u64).cast(),
                 (&mut p_mrg as *mut u64).cast(),
@@ -620,7 +765,7 @@ impl GpuCommitBases {
                 rt.drv
                     .launch(
                         rt.fn_merge,
-                        (merges_h.len() as u32, 1, 1),
+                        (num_merges as u32, 1, 1),
                         (32, 1, 1),
                         0,
                         &mut params_mrg,
@@ -649,14 +794,16 @@ impl GpuCommitBases {
                 )
                 .map_err(|e| ("launch_reduce", e))?;
         }
-        // 7. Copy window sums (~17 KB) to host and combine into `K` G1Affines.
-        let mut wsums_h = vec![GpuXyzz::default(); num_windows_total];
+        // 7. Overlap CPU post-processing (e.g. `FastFr -> BlsScalar`) while the
+        // asynchronous GPU pipeline executes `build_tasks + scatter +
+        // accumulate + merge + reduce`, then download the ~17 KB window sums.
+        let overlapped_res = while_gpu_busy();
+        let wsums_h = scratch.host_wsums.ensure_len(num_windows_total);
         rt.drv
-            .copy_dtoh(&mut wsums_h, scratch.window_sums.ptr)
+            .copy_dtoh(wsums_h, scratch.window_sums.ptr)
             .map_err(|e| ("dtoh_wsums", e))?;
+        let wsums_aff = xyzz_batch_to_blst_affine(wsums_h);
         drop(scratch_guard);
-
-        let wsums_aff = xyzz_batch_to_blst_affine(&wsums_h);
         let mut projs = [blst_p1::default(); K];
         for (slot, &poly_idx) in
             active_indices[..active_count].iter().enumerate()
@@ -678,7 +825,7 @@ impl GpuCommitBases {
             projs[poly_idx] = acc;
         }
 
-        Ok(Some(blst_p1s_to_g1_affines(&projs)))
+        Ok(Some((blst_p1s_to_g1_affines(&projs), overlapped_res)))
     }
 }
 
@@ -696,6 +843,12 @@ pub(crate) struct GpuNttTables {
     coset_powers_d: CudaBuf,
     /// Flat `[8]` `FastFr` `c_k^n` values.
     ck_pown_d: CudaBuf,
+    /// Flat `[7 * n]` `FastFr` inverse coset twiddles for cosets `1..8`.
+    inv_twiddles_d: CudaBuf,
+    /// `[n]` `FastFr` `gen_inv_t_scaled` for radix-8 combine.
+    gen_inv_t_d: CudaBuf,
+    /// `[10]` `FastFr` `[w1, w2, w3, sn[0..7]]` for radix-8 combine.
+    combine_consts_d: CudaBuf,
     /// Owned VRAM buffers for the 13–17 flat `[8 * n]` selector/precomputed
     /// evaluation tables.
     _sel_bufs: Vec<CudaBuf>,
@@ -707,8 +860,8 @@ pub(crate) struct GpuNttTables {
 
 impl GpuNttTables {
     /// Upload `domain_fft_roots`, `domain_ifft_roots`, `domain_size_inv`,
-    /// coset powers, and all 17 selector/precomputed evaluation tables once to
-    /// GPU VRAM.
+    /// coset powers, radix-8 combine tables, and all 17 selector/precomputed
+    /// evaluation tables once to GPU VRAM.
     ///
     /// `selectors[s]` (`0..17`) holds `Option<[&[FastFr]; 8]>` in the exact
     /// order expected by `quotient_eval_wave`:
@@ -724,6 +877,9 @@ impl GpuNttTables {
         coset_powers: [&[FastFr]; 8],
         ck_pown: [FastFr; 8],
         vanishing_inv: [FastFr; 8],
+        inv_twiddles: [&[FastFr]; 7],
+        gen_inv_t: &[FastFr],
+        combine_consts: [FastFr; 10],
         selectors: [Option<[Option<&[FastFr]>; 8]>; 17],
     ) -> Option<Self> {
         if n < GPU_NTT_MIN_LEN || !n.is_power_of_two() || log_n < 8 {
@@ -756,6 +912,26 @@ impl GpuNttTables {
         let ck_pown_d =
             CudaBuf::alloc(rt.drv, core::mem::size_of_val(&ck_pown)).ok()?;
         rt.drv.copy_htod(ck_pown_d.ptr, &ck_pown).ok()?;
+
+        flat.clear();
+        for tw in inv_twiddles {
+            flat.extend_from_slice(tw);
+        }
+        let inv_twiddles_d =
+            CudaBuf::alloc(rt.drv, core::mem::size_of_val(flat.as_slice()))
+                .ok()?;
+        rt.drv.copy_htod(inv_twiddles_d.ptr, &flat).ok()?;
+
+        let gen_inv_t_d =
+            CudaBuf::alloc(rt.drv, core::mem::size_of_val(gen_inv_t)).ok()?;
+        rt.drv.copy_htod(gen_inv_t_d.ptr, gen_inv_t).ok()?;
+
+        let combine_consts_d =
+            CudaBuf::alloc(rt.drv, core::mem::size_of_val(&combine_consts))
+                .ok()?;
+        rt.drv
+            .copy_htod(combine_consts_d.ptr, &combine_consts)
+            .ok()?;
 
         let mut sel_bufs = Vec::with_capacity(17);
         let mut sel_ptrs = [0u64; 17];
@@ -790,19 +966,858 @@ impl GpuNttTables {
             size_inv_d,
             coset_powers_d,
             ck_pown_d,
+            inv_twiddles_d,
+            gen_inv_t_d,
+            combine_consts_d,
             _sel_bufs: sel_bufs,
             sel_ptrs_d,
             vanishing_inv,
         })
     }
 
-    /// Run the **entire** 8-coset quotient pipeline in GPU VRAM:
-    /// 1. Upload `5` (or `6`) source polynomials ONCE via pinned DMA.
-    /// 2. For both waves (`0..4` and `4..8`): fused coset NTTs + pointwise
-    ///    6-widget PLONK constraint evaluation + vanishing division in VRAM.
-    /// 3. Run all 8 coset IFFTs in VRAM (with fused `size_inv` scaling).
-    /// 4. Download ONLY the 8 `n`-point coset IFFTs ONCE via pinned DMA and
-    ///    invoke `f` with the flat `&[FastFr]` slice (`[8 * n]`, zero copy).
+    /// Batched `K`-polynomial `n`-point IFFT on GPU, invoking `f` with the
+    /// raw pinned `[K * n]` `FastFr` output buffer so callers can blind and
+    /// launch GPU MSMs directly while overlapping `FastFr -> BlsScalar`
+    /// conversion on CPU.
+    pub(crate) fn with_ifft_batch_fast_fr<const K: usize, F, R>(
+        &self,
+        inputs: [&[BlsScalar]; K],
+        f: F,
+    ) -> Option<R>
+    where
+        F: FnOnce(&mut [FastFr]) -> Option<R>,
+    {
+        if K == 0 || inputs.iter().any(|s| s.len() != self.n) {
+            return None;
+        }
+        let rt = gpu_runtime()?;
+        rt.drv.bind_ctx().ok()?;
+
+        let total_elems = K * self.n;
+        let bytes = total_elems * core::mem::size_of::<FastFr>();
+        let mut scratch_guard = rt.ntt_scratch.lock().ok()?;
+        let scratch = &mut *scratch_guard;
+        scratch.src.ensure_capacity(bytes).ok()?;
+        scratch.out.ensure_capacity(bytes).ok()?;
+
+        let src_ptr = scratch.src.ptr;
+        let out_ptr = scratch.out.ptr;
+        let packed = scratch.host_src.ensure_len(total_elems);
+        packed
+            .par_chunks_exact_mut(self.n)
+            .enumerate()
+            .for_each(|(i, dst)| {
+                for (d, s) in dst.iter_mut().zip(inputs[i].iter()) {
+                    *d = FastFr::from_bls(s);
+                }
+            });
+        rt.drv.copy_htod(src_ptr, packed).ok()?;
+
+        let mut p_in = src_ptr;
+        let mut p_roots = self.ifft_roots_d.ptr;
+        let mut p_out = out_ptr;
+        let mut p_n = self.n as u32;
+        let mut p_log_n = self.log_n;
+        let mut params_br: [*mut c_void; 5] = [
+            (&mut p_in as *mut u64).cast(),
+            (&mut p_roots as *mut u64).cast(),
+            (&mut p_out as *mut u64).cast(),
+            (&mut p_n as *mut u32).cast(),
+            (&mut p_log_n as *mut u32).cast(),
+        ];
+        let grid_br = (K * (self.n / 256)) as u32;
+        // SAFETY: matches `ntt_bitrev_stage8` signature.
+        unsafe {
+            rt.drv
+                .launch(
+                    rt.fn_ntt_bitrev_stage8,
+                    (grid_br, 1, 1),
+                    (128, 1, 1),
+                    0,
+                    &mut params_br,
+                )
+                .ok()?;
+        }
+
+        let mut p_bf = (K * (self.n / 2)) as u32;
+        let grid_bf = p_bf.div_ceil(256);
+        for stage in 8..self.log_n {
+            let mut p_stage = stage;
+            let mut p_scale = if stage + 1 == self.log_n {
+                self.size_inv_d.ptr
+            } else {
+                0
+            };
+            let mut params_r2: [*mut c_void; 7] = [
+                (&mut p_out as *mut u64).cast(),
+                (&mut p_roots as *mut u64).cast(),
+                (&mut p_scale as *mut u64).cast(),
+                (&mut p_n as *mut u32).cast(),
+                (&mut p_log_n as *mut u32).cast(),
+                (&mut p_stage as *mut u32).cast(),
+                (&mut p_bf as *mut u32).cast(),
+            ];
+            // SAFETY: matches `ntt_radix2_stage` signature.
+            unsafe {
+                rt.drv
+                    .launch(
+                        rt.fn_ntt_radix2,
+                        (grid_bf, 1, 1),
+                        (256, 1, 1),
+                        0,
+                        &mut params_r2,
+                    )
+                    .ok()?;
+            }
+        }
+
+        let flat_out = scratch.host_out.ensure_len(total_elems);
+        rt.drv.copy_dtoh(flat_out, out_ptr).ok()?;
+        f(flat_out)
+    }
+
+    /// Batched `K`-polynomial `n`-point IFFT on GPU (used for public-input
+    /// polynomial when no immediate commitment overlaps it).
+    pub(crate) fn ifft_batch<const K: usize>(
+        &self,
+        inputs: [&[BlsScalar]; K],
+        extra_cap: usize,
+    ) -> Option<[Vec<BlsScalar>; K]> {
+        let n = self.n;
+        self.with_ifft_batch_fast_fr(inputs, |flat_out| {
+            let mut out_vecs: [Vec<BlsScalar>; K] =
+                core::array::from_fn(|_| {
+                    let mut v = Vec::with_capacity(n + extra_cap);
+                    v.resize(n, BlsScalar::zero());
+                    v
+                });
+            out_vecs.par_iter_mut().enumerate().for_each(|(i, dst)| {
+                let src = &flat_out[i * n..(i + 1) * n];
+                dst.par_chunks_mut(1024).zip(src.par_chunks(1024)).for_each(
+                    |(d_ch, s_ch)| {
+                        for (d, s) in d_ch.iter_mut().zip(s_ch.iter()) {
+                            *d = s.to_bls();
+                        }
+                    },
+                );
+            });
+            Some(out_vecs)
+        })
+    }
+
+    /// Run the **entire** 8-coset quotient pipeline + radix-8 combine in GPU
+    /// VRAM, then blind and commit `[t_low, t_mid, t_high, t_fourth]` on GPU
+    /// while overlapping `FastFr -> BlsScalar` conversion on CPU!
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn compute_and_commit_split_quotient_gpu<F>(
+        &self,
+        polys: &[&[BlsScalar]],
+        challenges: &[FastFr; 36],
+        blinders: [BlsScalar; 3],
+        gpu_bases: &GpuCommitBases,
+        max_degree: usize,
+        on_overflow: F,
+    ) -> Option<Result<SplitQuotientWithComms, crate::error::Error>>
+    where
+        F: FnOnce(
+            &[FastFr],
+        ) -> Result<[Vec<BlsScalar>; 4], crate::error::Error>,
+    {
+        let num_polys = polys.len();
+        if num_polys != 5 && num_polys != 6 {
+            return None;
+        }
+        let max_len = polys.iter().map(|p| p.len()).max().unwrap_or(0);
+        if max_len > 2 * self.n {
+            return None;
+        }
+        let src_stride = max_len.max(self.n);
+        let rt = gpu_runtime()?;
+        rt.drv.bind_ctx().ok()?;
+
+        let wave_batch = 4 * num_polys;
+        let wave_elems = wave_batch * self.n;
+        let q_elems = 8 * self.n;
+        let out_elems = wave_elems.max(q_elems);
+        let src_elems = num_polys * src_stride;
+
+        let mut scratch_guard = rt.ntt_scratch.lock().ok()?;
+        let scratch = &mut *scratch_guard;
+        scratch
+            .src
+            .ensure_capacity(src_elems * core::mem::size_of::<FastFr>())
+            .ok()?;
+        scratch
+            .out
+            .ensure_capacity(out_elems * core::mem::size_of::<FastFr>())
+            .ok()?;
+        scratch
+            .q_evals
+            .ensure_capacity(q_elems * core::mem::size_of::<FastFr>())
+            .ok()?;
+
+        let src_ptr = scratch.src.ptr;
+        let out_ptr = scratch.out.ptr;
+        let q_ptr = scratch.q_evals.ptr;
+        let ch_ptr = scratch.ch_buf.ptr;
+        let flags_ptr = scratch.flags_d.ptr;
+
+        let packed = scratch.host_src.ensure_len(src_elems);
+        packed
+            .par_chunks_exact_mut(src_stride)
+            .zip(polys.par_iter())
+            .for_each(|(dst, src)| {
+                for (d, s) in dst[..src.len()].iter_mut().zip(src.iter()) {
+                    *d = FastFr::from_bls(s);
+                }
+                for d in &mut dst[src.len()..] {
+                    *d = FastFr::ZERO;
+                }
+            });
+        rt.drv.copy_htod(src_ptr, packed).ok()?;
+
+        let mut ch_all = [FastFr::ZERO; 44];
+        ch_all[..36].copy_from_slice(challenges);
+        ch_all[36..44].copy_from_slice(&self.vanishing_inv);
+        rt.drv.copy_htod(ch_ptr, &ch_all).ok()?;
+
+        let mut p_src = src_ptr;
+        let mut p_fft_roots = self.fft_roots_d.ptr;
+        let mut p_out = out_ptr;
+        let mut p_q_out = q_ptr;
+        let mut p_sel_ptrs = self.sel_ptrs_d.ptr;
+        let mut p_ch = ch_ptr;
+        let mut p_n = self.n as u32;
+        let mut p_log_n = self.log_n;
+        let mut p_stride = src_stride as u32;
+        let mut p_npolys = num_polys as u32;
+        let mut p_zero_scale: u64 = 0;
+        let mut p_wave_bf = (wave_batch * (self.n / 2)) as u32;
+        let grid_cf = (wave_batch * (self.n / 256)) as u32;
+        let grid_wave_bf = p_wave_bf.div_ceil(256);
+        let grid_eval = ((4 * self.n) as u32).div_ceil(256);
+
+        for wave in 0..2usize {
+            let k_base = wave * 4;
+            let mut p_cp = self.coset_powers_d.ptr
+                + (k_base * self.n * core::mem::size_of::<FastFr>()) as u64;
+            let mut p_ckp = self.ck_pown_d.ptr
+                + (k_base * core::mem::size_of::<FastFr>()) as u64;
+            let mut params_cf: [*mut c_void; 9] = [
+                (&mut p_src as *mut u64).cast(),
+                (&mut p_cp as *mut u64).cast(),
+                (&mut p_ckp as *mut u64).cast(),
+                (&mut p_fft_roots as *mut u64).cast(),
+                (&mut p_out as *mut u64).cast(),
+                (&mut p_n as *mut u32).cast(),
+                (&mut p_log_n as *mut u32).cast(),
+                (&mut p_stride as *mut u32).cast(),
+                (&mut p_npolys as *mut u32).cast(),
+            ];
+            // SAFETY: matches `ntt_coset_fold_stage8` signature.
+            unsafe {
+                rt.drv
+                    .launch(
+                        rt.fn_ntt_coset_stage8,
+                        (grid_cf, 1, 1),
+                        (128, 1, 1),
+                        0,
+                        &mut params_cf,
+                    )
+                    .ok()?;
+            }
+
+            for stage in 8..self.log_n {
+                let mut p_stage = stage;
+                let mut params_r2: [*mut c_void; 7] = [
+                    (&mut p_out as *mut u64).cast(),
+                    (&mut p_fft_roots as *mut u64).cast(),
+                    (&mut p_zero_scale as *mut u64).cast(),
+                    (&mut p_n as *mut u32).cast(),
+                    (&mut p_log_n as *mut u32).cast(),
+                    (&mut p_stage as *mut u32).cast(),
+                    (&mut p_wave_bf as *mut u32).cast(),
+                ];
+                // SAFETY: matches `ntt_radix2_stage` signature.
+                unsafe {
+                    rt.drv
+                        .launch(
+                            rt.fn_ntt_radix2,
+                            (grid_wave_bf, 1, 1),
+                            (256, 1, 1),
+                            0,
+                            &mut params_r2,
+                        )
+                        .ok()?;
+                }
+            }
+
+            let mut p_k_base = k_base as u32;
+            let mut params_ev: [*mut c_void; 8] = [
+                (&mut p_out as *mut u64).cast(),
+                (&mut p_sel_ptrs as *mut u64).cast(),
+                (&mut p_ch as *mut u64).cast(),
+                (&mut p_q_out as *mut u64).cast(),
+                (&mut p_n as *mut u32).cast(),
+                (&mut p_log_n as *mut u32).cast(),
+                (&mut p_k_base as *mut u32).cast(),
+                (&mut p_npolys as *mut u32).cast(),
+            ];
+            // SAFETY: matches `quotient_eval_wave` signature.
+            unsafe {
+                rt.drv
+                    .launch(
+                        rt.fn_quot_eval,
+                        (grid_eval, 1, 1),
+                        (256, 1, 1),
+                        0,
+                        &mut params_ev,
+                    )
+                    .ok()?;
+            }
+        }
+
+        let mut p_ifft_roots = self.ifft_roots_d.ptr;
+        let mut params_br: [*mut c_void; 5] = [
+            (&mut p_q_out as *mut u64).cast(),
+            (&mut p_ifft_roots as *mut u64).cast(),
+            (&mut p_out as *mut u64).cast(),
+            (&mut p_n as *mut u32).cast(),
+            (&mut p_log_n as *mut u32).cast(),
+        ];
+        let grid_br = (8 * (self.n / 256)) as u32;
+        // SAFETY: matches `ntt_bitrev_stage8` signature.
+        unsafe {
+            rt.drv
+                .launch(
+                    rt.fn_ntt_bitrev_stage8,
+                    (grid_br, 1, 1),
+                    (128, 1, 1),
+                    0,
+                    &mut params_br,
+                )
+                .ok()?;
+        }
+
+        let mut p_ifft_bf = (8 * (self.n / 2)) as u32;
+        let grid_ifft_bf = p_ifft_bf.div_ceil(256);
+        for stage in 8..self.log_n {
+            let mut p_stage = stage;
+            let mut p_scale = if stage + 1 == self.log_n {
+                self.size_inv_d.ptr
+            } else {
+                0
+            };
+            let mut params_r2: [*mut c_void; 7] = [
+                (&mut p_out as *mut u64).cast(),
+                (&mut p_ifft_roots as *mut u64).cast(),
+                (&mut p_scale as *mut u64).cast(),
+                (&mut p_n as *mut u32).cast(),
+                (&mut p_log_n as *mut u32).cast(),
+                (&mut p_stage as *mut u32).cast(),
+                (&mut p_ifft_bf as *mut u32).cast(),
+            ];
+            // SAFETY: matches `ntt_radix2_stage` signature.
+            unsafe {
+                rt.drv
+                    .launch(
+                        rt.fn_ntt_radix2,
+                        (grid_ifft_bf, 1, 1),
+                        (256, 1, 1),
+                        0,
+                        &mut params_r2,
+                    )
+                    .ok()?;
+            }
+        }
+
+        rt.drv.memset_zero(flags_ptr, 4).ok()?;
+        let mut p_inv_tw = self.inv_twiddles_d.ptr;
+        let mut p_gen_t = self.gen_inv_t_d.ptr;
+        let mut p_consts = self.combine_consts_d.ptr;
+        let mut p_flags = flags_ptr;
+        let mut params_comb: [*mut c_void; 7] = [
+            (&mut p_out as *mut u64).cast(),
+            (&mut p_inv_tw as *mut u64).cast(),
+            (&mut p_gen_t as *mut u64).cast(),
+            (&mut p_consts as *mut u64).cast(),
+            (&mut p_q_out as *mut u64).cast(),
+            (&mut p_flags as *mut u64).cast(),
+            (&mut p_n as *mut u32).cast(),
+        ];
+        let grid_comb = (self.n as u32).div_ceil(256);
+        // SAFETY: matches `quotient_radix8_combine` signature.
+        unsafe {
+            rt.drv
+                .launch(
+                    rt.fn_quot_combine,
+                    (grid_comb, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    &mut params_comb,
+                )
+                .ok()?;
+        }
+
+        let flags_h = scratch.host_flags.ensure_len(1);
+        rt.drv.copy_dtoh(flags_h, flags_ptr).ok()?;
+        let flags = flags_h[0];
+        if (flags & 1) != 0 {
+            return Some(Err(crate::error::Error::CircuitUnsatisfied));
+        }
+        if (flags & 2) != 0 {
+            let flat_out = scratch.host_out.ensure_len(q_elems);
+            rt.drv.copy_dtoh(flat_out, out_ptr).ok()?;
+            let mut vecs = match on_overflow(flat_out) {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            drop(scratch_guard);
+            vecs[0].push(blinders[0]);
+            vecs[1][0] -= blinders[0];
+            vecs[1].push(blinders[1]);
+            vecs[2][0] -= blinders[1];
+            vecs[2].push(blinders[2]);
+            vecs[3][0] -= blinders[2];
+            for v in &vecs {
+                if v.len() > gpu_bases.base_len {
+                    return Some(Err(
+                        crate::error::Error::PolynomialDegreeTooLarge,
+                    ));
+                }
+                let deg = v
+                    .iter()
+                    .rposition(|c| *c != BlsScalar::zero())
+                    .unwrap_or(0);
+                if deg > max_degree {
+                    return Some(Err(
+                        crate::error::Error::PolynomialDegreeTooLarge,
+                    ));
+                }
+            }
+            let raw = vecs.each_ref().map(|v| v.as_slice());
+            let comms = gpu_bases.msm_batch(raw)?;
+            return Some(Ok((vecs, comms)));
+        }
+
+        let dl_elems = 4 * self.n + 16;
+        let flat_t = scratch.host_out.ensure_len(dl_elems);
+        rt.drv.copy_dtoh(flat_t, q_ptr).ok()?;
+
+        let n = self.n;
+        let fb0 = FastFr::from_bls(&blinders[0]);
+        let fb1 = FastFr::from_bls(&blinders[1]);
+        let fb2 = FastFr::from_bls(&blinders[2]);
+        flat_t[n] = flat_t[n].sub_portable(fb0);
+        flat_t[2 * n] = flat_t[2 * n].sub_portable(fb1);
+        flat_t[3 * n] = flat_t[3 * n].sub_portable(fb2);
+
+        let extra = &flat_t[4 * n..dl_elems];
+        let max_tail = extra.iter().rposition(|v| !v.is_zero());
+        let tail_slice = if let Some(m) = max_tail {
+            &extra[..=m]
+        } else {
+            &[]
+        };
+
+        let len4 = n + tail_slice.len();
+        if n + 1 > gpu_bases.base_len
+            || len4 > gpu_bases.base_len
+            || n > max_degree
+            || len4.saturating_sub(1) > max_degree
+        {
+            return Some(Err(crate::error::Error::PolynomialDegreeTooLarge));
+        }
+
+        let b0_arr = [fb0];
+        let b1_arr = [fb1];
+        let b2_arr = [fb2];
+        let (comms, t_vecs) = gpu_bases.msm_batch_fast_fr_with_overlap(
+            [
+                (&flat_t[0..n], &b0_arr),
+                (&flat_t[n..2 * n], &b1_arr),
+                (&flat_t[2 * n..3 * n], &b2_arr),
+                (&flat_t[3 * n..4 * n], tail_slice),
+            ],
+            || {
+                let mut vecs: [Vec<BlsScalar>; 4] = [
+                    vec![BlsScalar::zero(); n + 1],
+                    vec![BlsScalar::zero(); n + 1],
+                    vec![BlsScalar::zero(); n + 1],
+                    vec![BlsScalar::zero(); len4],
+                ];
+                vecs.par_iter_mut().enumerate().for_each(|(s, dst)| {
+                    let src = &flat_t[s * n..(s + 1) * n];
+                    dst[..n]
+                        .par_chunks_mut(1024)
+                        .zip(src.par_chunks(1024))
+                        .for_each(|(d_ch, s_ch)| {
+                            for (d, v) in d_ch.iter_mut().zip(s_ch.iter()) {
+                                *d = v.to_bls();
+                            }
+                        });
+                });
+                vecs[0][n] = blinders[0];
+                vecs[1][n] = blinders[1];
+                vecs[2][n] = blinders[2];
+                if let Some(m) = max_tail {
+                    for idx in 0..=m {
+                        if !extra[idx].is_zero() {
+                            vecs[3][n + idx] = extra[idx].to_bls();
+                        }
+                    }
+                } else {
+                    let mut l = vecs[3].len();
+                    while l > 0 && vecs[3][l - 1] == BlsScalar::zero() {
+                        l -= 1;
+                    }
+                    vecs[3].truncate(l);
+                    if vecs[3].is_empty() {
+                        vecs[3].push(BlsScalar::zero());
+                    }
+                }
+                vecs
+            },
+        )?;
+
+        Some(Ok((t_vecs, comms)))
+    }
+
+    /// Run the **entire** 8-coset quotient pipeline in GPU VRAM — including
+    /// the final radix-8 combine — returning `[t_low, t_mid, t_high, t_fourth]`
+    /// directly while downloading only `4 * n + 16` `FastFr`s (`8 MB` at `2^16`
+    /// instead of `16 MB`).
+    pub(crate) fn compute_split_quotient_gpu<F>(
+        &self,
+        polys: &[&[BlsScalar]],
+        challenges: &[FastFr; 36],
+        on_overflow: F,
+    ) -> Option<Result<[Vec<BlsScalar>; 4], crate::error::Error>>
+    where
+        F: FnOnce(
+            &[FastFr],
+        ) -> Result<[Vec<BlsScalar>; 4], crate::error::Error>,
+    {
+        let num_polys = polys.len();
+        if num_polys != 5 && num_polys != 6 {
+            return None;
+        }
+        let max_len = polys.iter().map(|p| p.len()).max().unwrap_or(0);
+        if max_len > 2 * self.n {
+            return None;
+        }
+        let src_stride = max_len.max(self.n);
+        let rt = gpu_runtime()?;
+        rt.drv.bind_ctx().ok()?;
+
+        let wave_batch = 4 * num_polys;
+        let wave_elems = wave_batch * self.n;
+        let q_elems = 8 * self.n;
+        let out_elems = wave_elems.max(q_elems);
+        let src_elems = num_polys * src_stride;
+
+        let mut scratch_guard = rt.ntt_scratch.lock().ok()?;
+        let scratch = &mut *scratch_guard;
+        scratch
+            .src
+            .ensure_capacity(src_elems * core::mem::size_of::<FastFr>())
+            .ok()?;
+        scratch
+            .out
+            .ensure_capacity(out_elems * core::mem::size_of::<FastFr>())
+            .ok()?;
+        scratch
+            .q_evals
+            .ensure_capacity(q_elems * core::mem::size_of::<FastFr>())
+            .ok()?;
+
+        let src_ptr = scratch.src.ptr;
+        let out_ptr = scratch.out.ptr;
+        let q_ptr = scratch.q_evals.ptr;
+        let ch_ptr = scratch.ch_buf.ptr;
+        let flags_ptr = scratch.flags_d.ptr;
+
+        // 1. Pack & DMA-upload source polynomials ONCE + tiny 1.4 KB challenges.
+        let packed = scratch.host_src.ensure_len(src_elems);
+        packed
+            .par_chunks_exact_mut(src_stride)
+            .zip(polys.par_iter())
+            .for_each(|(dst, src)| {
+                for (d, s) in dst[..src.len()].iter_mut().zip(src.iter()) {
+                    *d = FastFr::from_bls(s);
+                }
+                for d in &mut dst[src.len()..] {
+                    *d = FastFr::ZERO;
+                }
+            });
+        rt.drv.copy_htod(src_ptr, packed).ok()?;
+
+        let mut ch_all = [FastFr::ZERO; 44];
+        ch_all[..36].copy_from_slice(challenges);
+        ch_all[36..44].copy_from_slice(&self.vanishing_inv);
+        rt.drv.copy_htod(ch_ptr, &ch_all).ok()?;
+
+        // 2. Wave 0 and Wave 1: forward coset NTTs + pointwise evaluation in VRAM.
+        let mut p_src = src_ptr;
+        let mut p_fft_roots = self.fft_roots_d.ptr;
+        let mut p_out = out_ptr;
+        let mut p_q_out = q_ptr;
+        let mut p_sel_ptrs = self.sel_ptrs_d.ptr;
+        let mut p_ch = ch_ptr;
+        let mut p_n = self.n as u32;
+        let mut p_log_n = self.log_n;
+        let mut p_stride = src_stride as u32;
+        let mut p_npolys = num_polys as u32;
+        let mut p_zero_scale: u64 = 0;
+        let mut p_wave_bf = (wave_batch * (self.n / 2)) as u32;
+        let grid_cf = (wave_batch * (self.n / 256)) as u32;
+        let grid_wave_bf = p_wave_bf.div_ceil(256);
+        let grid_eval = ((4 * self.n) as u32).div_ceil(256);
+
+        for wave in 0..2usize {
+            let k_base = wave * 4;
+            let mut p_cp = self.coset_powers_d.ptr
+                + (k_base * self.n * core::mem::size_of::<FastFr>()) as u64;
+            let mut p_ckp = self.ck_pown_d.ptr
+                + (k_base * core::mem::size_of::<FastFr>()) as u64;
+            let mut params_cf: [*mut c_void; 9] = [
+                (&mut p_src as *mut u64).cast(),
+                (&mut p_cp as *mut u64).cast(),
+                (&mut p_ckp as *mut u64).cast(),
+                (&mut p_fft_roots as *mut u64).cast(),
+                (&mut p_out as *mut u64).cast(),
+                (&mut p_n as *mut u32).cast(),
+                (&mut p_log_n as *mut u32).cast(),
+                (&mut p_stride as *mut u32).cast(),
+                (&mut p_npolys as *mut u32).cast(),
+            ];
+            // SAFETY: matches `ntt_coset_fold_stage8` signature.
+            unsafe {
+                rt.drv
+                    .launch(
+                        rt.fn_ntt_coset_stage8,
+                        (grid_cf, 1, 1),
+                        (128, 1, 1),
+                        0,
+                        &mut params_cf,
+                    )
+                    .ok()?;
+            }
+
+            for stage in 8..self.log_n {
+                let mut p_stage = stage;
+                let mut params_r2: [*mut c_void; 7] = [
+                    (&mut p_out as *mut u64).cast(),
+                    (&mut p_fft_roots as *mut u64).cast(),
+                    (&mut p_zero_scale as *mut u64).cast(),
+                    (&mut p_n as *mut u32).cast(),
+                    (&mut p_log_n as *mut u32).cast(),
+                    (&mut p_stage as *mut u32).cast(),
+                    (&mut p_wave_bf as *mut u32).cast(),
+                ];
+                // SAFETY: matches `ntt_radix2_stage` signature.
+                unsafe {
+                    rt.drv
+                        .launch(
+                            rt.fn_ntt_radix2,
+                            (grid_wave_bf, 1, 1),
+                            (256, 1, 1),
+                            0,
+                            &mut params_r2,
+                        )
+                        .ok()?;
+                }
+            }
+
+            let mut p_k_base = k_base as u32;
+            let mut params_ev: [*mut c_void; 8] = [
+                (&mut p_out as *mut u64).cast(),
+                (&mut p_sel_ptrs as *mut u64).cast(),
+                (&mut p_ch as *mut u64).cast(),
+                (&mut p_q_out as *mut u64).cast(),
+                (&mut p_n as *mut u32).cast(),
+                (&mut p_log_n as *mut u32).cast(),
+                (&mut p_k_base as *mut u32).cast(),
+                (&mut p_npolys as *mut u32).cast(),
+            ];
+            // SAFETY: matches `quotient_eval_wave` signature.
+            unsafe {
+                rt.drv
+                    .launch(
+                        rt.fn_quot_eval,
+                        (grid_eval, 1, 1),
+                        (256, 1, 1),
+                        0,
+                        &mut params_ev,
+                    )
+                    .ok()?;
+            }
+        }
+
+        // 3. Run all 8 coset IFFTs directly from `q_evals` -> `out` in VRAM.
+        let mut p_ifft_roots = self.ifft_roots_d.ptr;
+        let mut params_br: [*mut c_void; 5] = [
+            (&mut p_q_out as *mut u64).cast(),
+            (&mut p_ifft_roots as *mut u64).cast(),
+            (&mut p_out as *mut u64).cast(),
+            (&mut p_n as *mut u32).cast(),
+            (&mut p_log_n as *mut u32).cast(),
+        ];
+        let grid_br = (8 * (self.n / 256)) as u32;
+        // SAFETY: matches `ntt_bitrev_stage8` signature.
+        unsafe {
+            rt.drv
+                .launch(
+                    rt.fn_ntt_bitrev_stage8,
+                    (grid_br, 1, 1),
+                    (128, 1, 1),
+                    0,
+                    &mut params_br,
+                )
+                .ok()?;
+        }
+
+        let mut p_ifft_bf = (8 * (self.n / 2)) as u32;
+        let grid_ifft_bf = p_ifft_bf.div_ceil(256);
+        for stage in 8..self.log_n {
+            let mut p_stage = stage;
+            let mut p_scale = if stage + 1 == self.log_n {
+                self.size_inv_d.ptr
+            } else {
+                0
+            };
+            let mut params_r2: [*mut c_void; 7] = [
+                (&mut p_out as *mut u64).cast(),
+                (&mut p_ifft_roots as *mut u64).cast(),
+                (&mut p_scale as *mut u64).cast(),
+                (&mut p_n as *mut u32).cast(),
+                (&mut p_log_n as *mut u32).cast(),
+                (&mut p_stage as *mut u32).cast(),
+                (&mut p_ifft_bf as *mut u32).cast(),
+            ];
+            // SAFETY: matches `ntt_radix2_stage` signature.
+            unsafe {
+                rt.drv
+                    .launch(
+                        rt.fn_ntt_radix2,
+                        (grid_ifft_bf, 1, 1),
+                        (256, 1, 1),
+                        0,
+                        &mut params_r2,
+                    )
+                    .ok()?;
+            }
+        }
+
+        // 4. Radix-8 inverse DFT combine on GPU (`out[8*n] -> q_evals[4*n+16]`).
+        rt.drv.memset_zero(flags_ptr, 4).ok()?;
+        let mut p_inv_tw = self.inv_twiddles_d.ptr;
+        let mut p_gen_t = self.gen_inv_t_d.ptr;
+        let mut p_consts = self.combine_consts_d.ptr;
+        let mut p_flags = flags_ptr;
+        let mut params_comb: [*mut c_void; 7] = [
+            (&mut p_out as *mut u64).cast(),
+            (&mut p_inv_tw as *mut u64).cast(),
+            (&mut p_gen_t as *mut u64).cast(),
+            (&mut p_consts as *mut u64).cast(),
+            (&mut p_q_out as *mut u64).cast(),
+            (&mut p_flags as *mut u64).cast(),
+            (&mut p_n as *mut u32).cast(),
+        ];
+        let grid_comb = (self.n as u32).div_ceil(256);
+        // SAFETY: matches `quotient_radix8_combine` signature.
+        unsafe {
+            rt.drv
+                .launch(
+                    rt.fn_quot_combine,
+                    (grid_comb, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    &mut params_comb,
+                )
+                .ok()?;
+        }
+
+        let flags_h = scratch.host_flags.ensure_len(1);
+        rt.drv.copy_dtoh(flags_h, flags_ptr).ok()?;
+        let flags = flags_h[0];
+        if (flags & 1) != 0 {
+            return Some(Err(crate::error::Error::CircuitUnsatisfied));
+        }
+        if (flags & 2) != 0 {
+            // Rare over-degree tail fallback: raw coset IFFTs are intact in `out`.
+            let flat_out = scratch.host_out.ensure_len(q_elems);
+            rt.drv.copy_dtoh(flat_out, out_ptr).ok()?;
+            return Some(on_overflow(flat_out));
+        }
+
+        // 5. Download ONLY `4 * n + 16` FastFrs (`8 MB` at 2^16 instead of `16 MB`).
+        let dl_elems = 4 * self.n + 16;
+        let flat_t = scratch.host_out.ensure_len(dl_elems);
+        rt.drv.copy_dtoh(flat_t, q_ptr).ok()?;
+
+        let extra = &flat_t[4 * self.n..dl_elems];
+        let max_tail = extra.iter().rposition(|v| !v.is_zero());
+        let n = self.n;
+        let mut t_vecs: [Vec<BlsScalar>; 4] = [
+            {
+                let mut v = Vec::with_capacity(n + 1);
+                v.resize(n, BlsScalar::zero());
+                v
+            },
+            {
+                let mut v = Vec::with_capacity(n + 1);
+                v.resize(n, BlsScalar::zero());
+                v
+            },
+            {
+                let mut v = Vec::with_capacity(n + 1);
+                v.resize(n, BlsScalar::zero());
+                v
+            },
+            {
+                let len4 = if let Some(m) = max_tail { n + m + 1 } else { n };
+                let mut v = Vec::with_capacity(len4);
+                v.resize(len4, BlsScalar::zero());
+                v
+            },
+        ];
+
+        t_vecs.par_iter_mut().enumerate().for_each(|(s, dst)| {
+            let src = &flat_t[s * n..(s + 1) * n];
+            dst[..n]
+                .par_chunks_mut(1024)
+                .zip(src.par_chunks(1024))
+                .for_each(|(d_ch, s_ch)| {
+                    for (d, v) in d_ch.iter_mut().zip(s_ch.iter()) {
+                        *d = v.to_bls();
+                    }
+                });
+        });
+
+        if let Some(m) = max_tail {
+            for idx in 0..=m {
+                if !extra[idx].is_zero() {
+                    t_vecs[3][n + idx] = extra[idx].to_bls();
+                }
+            }
+        } else {
+            let mut l = t_vecs[3].len();
+            while l > 0 && t_vecs[3][l - 1] == BlsScalar::zero() {
+                l -= 1;
+            }
+            t_vecs[3].truncate(l);
+            if t_vecs[3].is_empty() {
+                t_vecs[3].push(BlsScalar::zero());
+            }
+        }
+
+        Some(Ok(t_vecs))
+    }
+
+    /// Run the **entire** 8-coset quotient pipeline in GPU VRAM and return raw
+    /// coset IFFTs via `f` (used by direct GPU-vs-CPU equivalence unit tests).
+    #[cfg(test)]
     pub(crate) fn with_full_quotient_iffts<F, R>(
         &self,
         polys: &[&[BlsScalar]],
@@ -1452,6 +2467,7 @@ mod tests {
         let cp_refs: [&[FastFr]; 8] =
             core::array::from_fn(|k| cp_vecs[k].as_slice());
 
+        let zero_n = vec![FastFr::ZERO; n];
         let tables = GpuNttTables::upload(
             n,
             log_n,
@@ -1461,6 +2477,9 @@ mod tests {
             cp_refs,
             ck_pown,
             [FastFr::ONE; 8],
+            [zero_n.as_slice(); 7],
+            &zero_n,
+            [FastFr::ZERO; 10],
             [None; 17],
         )
         .expect("GPU NTT table upload should succeed");

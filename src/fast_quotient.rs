@@ -337,6 +337,21 @@ impl FastProverCache {
                     req_sel(|c| &c.linear_evals),
                     req_sel(|c| &c.l1_evals),
                 ];
+                let inv_twiddles: [&[FastFr]; 7] = core::array::from_fn(|i| {
+                    self.cosets[i + 1].inv_twiddle.as_slice()
+                });
+                let combine_consts = [
+                    self.omega_8_inv_1,
+                    self.omega_8_inv_2,
+                    self.omega_8_inv_3,
+                    self.gen_inv_sn[0],
+                    self.gen_inv_sn[1],
+                    self.gen_inv_sn[2],
+                    self.gen_inv_sn[3],
+                    self.gen_inv_sn[4],
+                    self.gen_inv_sn[5],
+                    self.gen_inv_sn[6],
+                ];
                 crate::gpu_cuda::GpuNttTables::upload(
                     n,
                     log_n,
@@ -346,10 +361,96 @@ impl FastProverCache {
                     coset_powers,
                     ck_pown,
                     vanishing_inv,
+                    inv_twiddles,
+                    &self.gen_inv_t_scaled,
+                    combine_consts,
                     selectors,
                 )
             })
             .as_ref()
+    }
+
+    #[cfg(feature = "gpu-cuda")]
+    pub(crate) fn with_ifft_batch_fast_fr<const K: usize, F, R>(
+        &self,
+        n: usize,
+        log_n: u32,
+        inputs: [&[BlsScalar]; K],
+        f: F,
+    ) -> Option<R>
+    where
+        F: FnOnce(&mut [FastFr]) -> Option<R>,
+    {
+        self.gpu_ntt_tables(n, log_n)?
+            .with_ifft_batch_fast_fr(inputs, f)
+    }
+
+    #[cfg(feature = "gpu-cuda")]
+    pub(crate) fn ifft_batch_gpu<const K: usize>(
+        &self,
+        n: usize,
+        log_n: u32,
+        inputs: [&[BlsScalar]; K],
+        extra_cap: usize,
+    ) -> Option<[Vec<BlsScalar>; K]> {
+        self.gpu_ntt_tables(n, log_n)?.ifft_batch(inputs, extra_cap)
+    }
+
+    /// Fused GPU quotient + blinding + commitment path overlapping
+    /// `FastFr -> BlsScalar` conversion on CPU while GPU runs `quot_msm`.
+    #[cfg(feature = "gpu-cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn compute_and_commit_split_quotient_gpu(
+        &self,
+        domain: &EvaluationDomain,
+        z_poly: &Polynomial,
+        (a_poly, b_poly, c_poly, d_poly): (
+            &Polynomial,
+            &Polynomial,
+            &Polynomial,
+            &Polynomial,
+        ),
+        pi_poly: &Polynomial,
+        challenges: &(
+            BlsScalar,
+            BlsScalar,
+            BlsScalar,
+            BlsScalar,
+            BlsScalar,
+            BlsScalar,
+            BlsScalar,
+        ),
+        blinders: [BlsScalar; 3],
+        gpu_bases: &crate::gpu_cuda::GpuCommitBases,
+        max_degree: usize,
+    ) -> Option<Result<crate::gpu_cuda::SplitQuotientWithComms, Error>> {
+        let n = domain.size();
+        let log_n = domain.log_size_of_group;
+        let has_pi = !pi_poly.is_zero();
+        let polys_per_coset = if has_pi { 6usize } else { 5usize };
+        let src_polys: [&[BlsScalar]; 6] = [
+            &z_poly[..],
+            &a_poly[..],
+            &b_poly[..],
+            &c_poly[..],
+            &d_poly[..],
+            &pi_poly[..],
+        ];
+        let ch = QuotientFastChallenges::new(challenges);
+        let gpu = self.gpu_ntt_tables(n, log_n)?;
+        let gpu_ch = ch.to_gpu_array();
+        gpu.compute_and_commit_split_quotient_gpu(
+            &src_polys[..polys_per_coset],
+            &gpu_ch,
+            blinders,
+            gpu_bases,
+            max_degree,
+            |flat| {
+                let coset_iffts: [&[FastFr]; 8] =
+                    core::array::from_fn(|k| &flat[k * n..(k + 1) * n]);
+                self.finalize_radix8_combine(coset_iffts, n)
+            },
+        )
     }
 
     fn finalize_radix8_combine(
@@ -457,11 +558,12 @@ impl FastProverCache {
 
         // Full GPU VRAM path: upload 5 (or 6) source polynomials once, run all
         // 40 forward coset NTTs + 524K pointwise widget evaluations + 8 inverse
-        // coset IFFTs in VRAM, and download only the 8 coset IFFTs once.
+        // coset IFFTs + radix-8 combine in VRAM, and download only `4 * n + 16`
+        // coefficients (`8 MB` at `2^16`).
         #[cfg(feature = "gpu-cuda")]
         if let Some(gpu) = self.gpu_ntt_tables(n, log_n) {
             let gpu_ch = ch.to_gpu_array();
-            if let Some(res) = gpu.with_full_quotient_iffts(
+            if let Some(res) = gpu.compute_split_quotient_gpu(
                 &src_polys[..polys_per_coset],
                 &gpu_ch,
                 |flat| {

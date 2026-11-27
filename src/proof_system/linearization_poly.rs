@@ -201,20 +201,21 @@ impl Serializable<{ 15 * BlsScalar::SIZE }> for ProofEvaluations {
     }
 }
 
-/// Compute the linearization polynomial.
+/// Compute the 16 scalar-polynomial terms that define the non-constant part of
+/// the linearization polynomial `r(X)`.
 #[cfg(feature = "alloc")]
-pub(crate) fn compute(
-    prover_key: &ProverKey,
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_terms<'a>(
+    prover_key: &'a ProverKey,
     challenges: &LinearizationChallenges,
-    z_poly: &Polynomial,
+    z_poly: &'a Polynomial,
     evaluations: &ProofEvaluations,
     domain: &EvaluationDomain,
-    t_low_poly: &Polynomial,
-    t_mid_poly: &Polynomial,
-    t_high_poly: &Polynomial,
-    t_fourth_poly: &Polynomial,
-    pub_inputs: &[BlsScalar],
-) -> Polynomial {
+    t_low_poly: &'a Polynomial,
+    t_mid_poly: &'a Polynomial,
+    t_high_poly: &'a Polynomial,
+    t_fourth_poly: &'a Polynomial,
+) -> [(BlsScalar, &'a Polynomial); 16] {
     use crate::proof_system::widget::ecc::curve_addition::ProverKey as CurveAddProverKey;
     use crate::proof_system::widget::ecc::scalar_mul::fixed_base::ProverKey as FixedBaseProverKey;
     use crate::proof_system::widget::logic::ProverKey as LogicProverKey;
@@ -282,13 +283,7 @@ pub(crate) fn compute(
     let t_high_scalar = z_h_eval * z_two_n;
     let t_fourth_scalar = z_h_eval * z_three_n;
 
-    let pi_eval = proof::alloc::compute_barycentric_eval(
-        pub_inputs,
-        &challenges.z,
-        domain,
-    );
-
-    let terms: [(BlsScalar, &Polynomial); 16] = [
+    [
         (arith_q_m, &prover_key.arithmetic.q_m.0),
         (arith_q_l, &prover_key.arithmetic.q_l.0),
         (arith_q_r, &prover_key.arithmetic.q_r.0),
@@ -305,7 +300,40 @@ pub(crate) fn compute(
         (t_mid_scalar, t_mid_poly),
         (t_high_scalar, t_high_poly),
         (t_fourth_scalar, t_fourth_poly),
-    ];
+    ]
+}
+
+/// Compute the linearization polynomial.
+#[cfg(feature = "alloc")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn compute(
+    prover_key: &ProverKey,
+    challenges: &LinearizationChallenges,
+    z_poly: &Polynomial,
+    evaluations: &ProofEvaluations,
+    domain: &EvaluationDomain,
+    t_low_poly: &Polynomial,
+    t_mid_poly: &Polynomial,
+    t_high_poly: &Polynomial,
+    t_fourth_poly: &Polynomial,
+    pub_inputs: &[BlsScalar],
+) -> Polynomial {
+    let pi_eval = proof::alloc::compute_barycentric_eval(
+        pub_inputs,
+        &challenges.z,
+        domain,
+    );
+    let terms = compute_terms(
+        prover_key,
+        challenges,
+        z_poly,
+        evaluations,
+        domain,
+        t_low_poly,
+        t_mid_poly,
+        t_high_poly,
+        t_fourth_poly,
+    );
 
     let max_len = terms
         .iter()
